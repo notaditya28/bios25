@@ -1,0 +1,62 @@
+[project]
+name = "traderadar-backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.*",
+    "uvicorn[standard]==0.32.*",
+    "sqlalchemy==2.0.*",
+    "psycopg[binary]==3.2.*",
+    "alembic==1.14.*",
+    "geoalchemy2[shapely]==0.16.*",
+    "pydantic==2.10.*",
+    "pydantic-settings==2.6.*",
+    "email-validator==2.2.*",
+    "argon2-cffi==23.1.*",
+    "celery[redis]==5.4.*",
+    "redis==5.2.*",
+    "httpx==0.28.*",
+    "tenacity==9.0.*",
+    "structlog==24.4.*",
+    "python-multipart==0.0.*",
+    "pyshp==2.3.*",
+    "pycountry==24.6.*",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.*",
+    "pytest-cov==6.0.*",
+    "ruff==0.8.*",
+    "mypy==1.13.*",
+]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "SIM", "RUF"]
+ignore = ["S101", "B008", "RUF012"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]
+"alembic/*" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
