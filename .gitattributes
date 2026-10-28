@@ -1,0 +1,5 @@
+# Files run inside Linux containers must keep LF endings regardless of the host OS.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.zip binary
