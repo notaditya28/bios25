@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from app.api import admin, auth, imports, orgs, trade
+from app.api import admin, auth, imports, orgs, screening, trade
 from app.config import get_settings
 from app.db import SessionLocal
 from app.logging import configure_logging, log
@@ -69,5 +69,5 @@ def readyz() -> JSONResponse:
     return JSONResponse({"ok": ok, **checks}, status_code=200 if ok else 503)
 
 
-for r in (auth.router, orgs.router, trade.router, imports.router, admin.router):
+for r in (auth.router, orgs.router, trade.router, imports.router, screening.router, admin.router):
     app.include_router(r)

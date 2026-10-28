@@ -16,7 +16,10 @@ from app.models import (
     Membership,
     Organization,
     OrgType,
+    Partner,
     Role,
+    Shipment,
+    SubjectType,
     TokenType,
     User,
 )
@@ -32,10 +35,12 @@ from app.schemas.org import (
     OrgPatch,
     RolePatch,
 )
+from app.screening.service import forget_subject
 from app.services.audit import audit
 from app.services.email import invite_email
 from app.services.tokens import consume_token, issue_token
 from app.tasks.email import enqueue
+from app.tasks.sanctions import request_screening
 
 router = APIRouter(prefix="/api", tags=["organizations"])
 
@@ -323,6 +328,7 @@ def create_company(
         after=body.model_dump(mode="json"),
     )
     db.commit()
+    request_screening(SubjectType.company, company.id)
     return company
 
 
@@ -353,6 +359,7 @@ def update_company(
         after=body.model_dump(mode="json"),
     )
     db.commit()
+    request_screening(SubjectType.company, company.id)
     return company
 
 
@@ -372,5 +379,11 @@ def delete_company(
         target_id=company.id,
         before={"name": company.name},
     )
+    # Screenings reference subjects without an FK, so clear the company's and its children's.
+    child_ids = [company.id]
+    child_ids += db.scalars(select(Partner.id).where(Partner.company_id == company.id)).all()
+    child_ids += db.scalars(select(Shipment.id).where(Shipment.company_id == company.id)).all()
+    for sid in child_ids:
+        forget_subject(db, sid)
     db.delete(company)
     db.commit()

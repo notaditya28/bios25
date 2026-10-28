@@ -9,6 +9,7 @@ from app.db import get_db
 from app.deps import OrgContext, company_in_org, get_org
 from app.schemas.trade import ImportResult
 from app.services.csv_import import MAX_BYTES, ImportFileError, run_import, template_csv
+from app.tasks.sanctions import rescreen_org
 
 router = APIRouter(prefix="/api", tags=["imports"])
 
@@ -37,7 +38,7 @@ def import_csv(
     # Sync route: runs in the threadpool, so the blocking read and DB work don't stall the loop.
     content = file.file.read(MAX_BYTES + 1)
     try:
-        return run_import(
+        result = run_import(
             db,
             company=company,
             kind=kind,
@@ -48,3 +49,6 @@ def import_csv(
         )
     except ImportFileError as e:
         raise HTTPException(422, str(e)) from None
+    if result.status == "committed" and kind in ("partners", "shipments"):
+        rescreen_org.delay(str(ctx.org.id))
+    return result

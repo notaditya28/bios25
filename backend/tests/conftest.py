@@ -60,6 +60,11 @@ TENANT_TABLES = [
     "organizations",
     "source_runs",
     "data_sources",
+    "screening_matches",
+    "screenings",
+    "sanction_names",
+    "sanction_entries",
+    "sanction_lists",
 ]
 
 # A few real reference ports (coordinates from UN/LOCODE / NGA WPI), enough for routing tests.

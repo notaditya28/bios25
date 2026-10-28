@@ -13,7 +13,9 @@ from app.schemas.auth import MessageOut
 from app.schemas.trade import PortCoordsIn, PortOut
 from app.services.audit import audit
 from app.services.serialize import port_out
+from app.sources.sanctions import LISTS
 from app.tasks.ports import refresh_ports
+from app.tasks.sanctions import refresh_sanctions
 
 router = APIRouter(prefix="/api", tags=["sources", "admin"])
 
@@ -98,6 +100,8 @@ RUNNABLE = {
     "ports_unlocode": refresh_ports,
     "ports_wpi": refresh_ports,
     "ports_natural_earth": refresh_ports,
+    # Lists are refreshed together; unchanged files are skipped cheaply by content hash.
+    **{spec.source.code: refresh_sanctions for spec in LISTS.values()},
 }
 
 

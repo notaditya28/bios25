@@ -55,6 +55,8 @@ services:
       target: dev
     environment:
       API_INTERNAL_URL: http://api:8000
+      # File-change events don't cross Windows/macOS bind mounts; poll instead.
+      WATCHPACK_POLLING: "true"
     volumes:
       - ./frontend:/app
       - /app/node_modules

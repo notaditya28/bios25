@@ -21,6 +21,9 @@ dependencies = [
     "python-multipart==0.0.*",
     "pyshp==2.3.*",
     "pycountry==24.6.*",
+    "rapidfuzz==3.11.*",
+    "jellyfish==1.1.*",
+    "anyascii==0.3.*",
 ]
 
 [project.optional-dependencies]
@@ -47,7 +50,8 @@ select = ["E", "F", "I", "B", "UP", "S", "SIM", "RUF"]
 ignore = ["S101", "B008", "RUF012"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S105", "S106"]
+"tests/*" = ["S105", "S106", "RUF001"]  # non-Latin names are deliberate test data
+"tests/test_sanctions_parsers.py" = ["E501"]  # verbatim XML excerpts
 "alembic/*" = ["E501"]
 
 [tool.mypy]

@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     source_user_agent: str = "TradeRadar/0.1"
     source_cache_dir: str = "/data/cache"
 
+    eu_fsf_token: str = ""
+    # Matches scoring at or above this (0-100) go to the human review queue.
+    screening_review_threshold: float = 85.0
+
     allow_dev_seed: bool = False
 
     @model_validator(mode="after")

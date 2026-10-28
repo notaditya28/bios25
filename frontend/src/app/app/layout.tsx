@@ -13,6 +13,7 @@ function Shell({ children }: { children: ReactNode }) {
     { href: "/app/shipments", label: "Shipments" },
     { href: "/app/lanes", label: "Lanes" },
     { href: "/app/partners", label: "Partners" },
+    { href: "/app/screening", label: "Sanctions screening" },
     { href: "/app/import", label: "CSV import" },
     ...(s.isForwarder ? [{ href: "/app/companies", label: "Client companies" }] : []),
     { href: "/app/team", label: "Team" },
@@ -83,6 +84,8 @@ function Shell({ children }: { children: ReactNode }) {
       <main className="mx-auto max-w-7xl px-4 py-6">{children}</main>
       <footer className="mx-auto max-w-7xl px-4 pb-8 text-xs text-slate-500">
         Port reference data: UN/LOCODE (UNECE), World Port Index (US NGA), Made with Natural Earth.
+        Sanctions lists: US Treasury OFAC; UN Security Council; European Commission; UK FCDO (contains
+        public sector information licensed under the Open Government Licence v3.0).
       </footer>
     </div>
   );

@@ -145,3 +145,73 @@ export interface SourceAdminStatus extends SourceStatus {
     error: string | null;
   }[];
 }
+
+export type MatchStatus = "pending" | "confirmed" | "dismissed";
+export type SubjectType = "partner" | "company" | "vessel";
+
+export interface SanctionListStatus {
+  code: string;
+  name: string;
+  publisher: string;
+  published_at: string | null;
+  fetched_at: string | null;
+  entry_count: number;
+  stale: boolean;
+}
+
+export interface ScreeningMatch {
+  id: string;
+  status: MatchStatus;
+  active: boolean;
+  score: number;
+  matched_name: string;
+  breakdown: {
+    method: string;
+    name_score: number | null;
+    imo?: string;
+    token_pairs?: [string, string, number][];
+    adjustments: { reason: string; delta: number }[];
+  };
+  subject: { type: SubjectType; id: string; name: string; country: string | null; imo: string | null };
+  entry: {
+    id: string;
+    list_code: string;
+    list_name: string;
+    source_uid: string;
+    entity_type: string;
+    primary_name: string;
+    names: string[];
+    programs: string[];
+    countries: string[];
+    birth_dates: string[];
+    imo_numbers: string[];
+    listed_on: string | null;
+    remarks: string | null;
+    active: boolean;
+    removed_at: string | null;
+    source_url: string | null;
+  };
+  screened_at: string;
+  list_versions: Record<string, { version: string; published_at: string | null }>;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+  review_note: string | null;
+}
+
+export interface ScreeningSummary {
+  pending: number;
+  confirmed: number;
+  dismissed: number;
+  subjects_screened: number;
+  last_run_at: string | null;
+  lists: SanctionListStatus[];
+  lists_stale: boolean;
+}
+
+export interface SubjectScreening {
+  subject_type: SubjectType;
+  subject_id: string;
+  run_at: string;
+  pending: number;
+  confirmed: number;
+}

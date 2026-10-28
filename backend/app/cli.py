@@ -28,15 +28,25 @@ def refresh_ports() -> int:
     return 0
 
 
+def refresh_sanctions() -> int:
+    from app.tasks.sanctions import refresh_sanctions_now
+
+    print(refresh_sanctions_now())
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("make-admin", help="grant platform-admin rights to an existing user")
     p.add_argument("email")
     sub.add_parser("refresh-ports", help="download and load port reference data now")
+    sub.add_parser("refresh-sanctions", help="download all sanctions lists and re-screen")
     args = parser.parse_args()
     if args.cmd == "make-admin":
         return make_admin(args.email)
+    if args.cmd == "refresh-sanctions":
+        return refresh_sanctions()
     return refresh_ports()
 
 

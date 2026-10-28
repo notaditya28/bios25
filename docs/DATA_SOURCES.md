@@ -10,14 +10,23 @@ Verified 28 Oct 2026. Re-check terms before launch and whenever a provider chang
 | NGA World Port Index (Pub. 150), `msi.nga.mil/api/publications/world-port-index?output=csv` | No key | US Government work, no copyright claimed | "World Port Index, US NGA" |
 | Natural Earth 1:10m ports | No key | Public domain | "Made with Natural Earth" |
 
+## In use (Milestone 2) — sanctions
+
+| List | URL | Access | Licence |
+|---|---|---|---|
+| OFAC SDN | `sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports/SDN_ENHANCED.XML` | No key | US Gov public data |
+| OFAC Consolidated (non-SDN) | `.../exports/CONS_ENHANCED.XML` | No key | US Gov public data |
+| UN Security Council | `scsanctions.un.org/resources/xml/en/consolidated.xml` | No key | Public UN document |
+| EU FSF | `webgate.ec.europa.eu/fsd/fsf/public/files/xmlFullSanctionsList_1_1/content?token=…` | `EU_FSF_TOKEN` (the published public token works; register your own) | Public EU data |
+| UK Sanctions List | `sanctionslist.fcdo.gov.uk/docs/UK-Sanctions-List.xml` | No key | Open Government Licence v3.0 (attribution shown in the app footer) |
+
+The matching libraries are all permissively licensed: `rapidfuzz` (MIT), `jellyfish` (MIT) and
+`anyascii` (ISC). `Unidecode` was avoided because it is GPL.
+
 ## Planned (later milestones) — see the approved plan for full notes
 
 | Source | Milestone | Key / account | Commercial notes |
 |---|---|---|---|
-| OFAC SDN + Consolidated (Advanced XML) | M2 | none | US Gov public data |
-| UN Security Council Consolidated List | M2 | none | public |
-| EU Financial Sanctions Files | M2 | `EU_FSF_TOKEN` (free registration) | public |
-| UK Sanctions List (FCDO) | M2 | none | OGL. The OFSI list closed on 28 Jan 2026. |
 | searoute-py | M3 | none | Apache-2.0 |
 | aisstream.io | M3 | `AISSTREAM_API_KEY` | No published ToS or SLA. Behind an adapter so it can be swapped. |
 | Open-Meteo | M3 | `OPEN_METEO_API_KEY` | **Free tier is non-commercial. A paid plan is required before launch.** |

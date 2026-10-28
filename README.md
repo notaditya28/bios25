@@ -3,8 +3,9 @@
 Trade-disruption and sanctions-risk monitoring for Indian SME exporters, importers, and the
 freight forwarders / customs house agents (CHAs) who serve them.
 
-**Status: Milestone 1 of 7** (skeleton, auth, organizations, partner/lane/shipment CRUD, CSV import,
-real port reference data). See [docs/MILESTONES.md](docs/MILESTONES.md) for what is real, what is
+**Status: Milestone 2 of 7.** M1 delivered the skeleton, auth, organizations, partner/lane/shipment
+CRUD, CSV import and real port reference data. M2 adds sanctions screening against the OFAC, UN, EU
+and UK lists, with a human review queue. See [docs/MILESTONES.md](docs/MILESTONES.md) for what is real, what is
 pending, and the known limitations.
 
 ## Stack
@@ -20,7 +21,8 @@ Prerequisites: Docker Desktop (or Docker Engine + Compose v2). Nothing else is n
 ```bash
 cp .env.example .env            # then set SECRET_KEY and POSTGRES_PASSWORD (also inside DATABASE_URL)
 docker compose up -d --build    # db, redis, api, worker, beat, web, mailpit
-docker compose exec api python -m app.cli refresh-ports   # load ~25k real ports/airports (≈30 s)
+docker compose exec api python -m app.cli refresh-ports       # ~25k real ports/airports (≈30 s)
+docker compose exec api python -m app.cli refresh-sanctions   # OFAC/UN/EU/UK lists (≈2 min first time)
 ```
 
 | URL | What |
@@ -36,7 +38,8 @@ First user:
 3. Optional: make yourself a platform admin to see the data-source health page:
    `docker compose exec api python -m app.cli make-admin you@yourcompany.com`
 
-The port reference refresh also runs every Sunday at 02:17 UTC via Celery beat.
+Celery beat refreshes ports weekly (Sunday 02:17 UTC) and sanctions lists every 6 hours, then
+re-screens all counterparties whenever a list changes. A full re-screen also runs daily at 03:41 UTC.
 
 ### Demo data (development only)
 
@@ -73,4 +76,6 @@ live in code. In production the app refuses to start with `COOKIE_SECURE=false`,
 ## Data attribution
 
 Port reference data: UN/LOCODE (UNECE); World Port Index (US National Geospatial-Intelligence
-Agency); Made with Natural Earth.
+Agency); Made with Natural Earth. Sanctions data: US Treasury OFAC; UN Security Council; European
+Commission; UK FCDO (contains public sector information licensed under the Open Government Licence
+v3.0).

@@ -13,6 +13,16 @@ from app.models.identity import (
     UserSession,
 )
 from app.models.ops import DataSource, SourceRun
+from app.models.sanctions import (
+    EntityType,
+    MatchStatus,
+    SanctionEntry,
+    SanctionList,
+    SanctionName,
+    Screening,
+    ScreeningMatch,
+    SubjectType,
+)
 from app.models.trade import (
     CoordSource,
     CsvImport,
@@ -33,7 +43,9 @@ __all__ = [
     "CoordSource",
     "CsvImport",
     "DataSource",
+    "EntityType",
     "Lane",
+    "MatchStatus",
     "Membership",
     "OAuthIdentity",
     "OrgType",
@@ -42,9 +54,15 @@ __all__ = [
     "PartnerKind",
     "Port",
     "Role",
+    "SanctionEntry",
+    "SanctionList",
+    "SanctionName",
+    "Screening",
+    "ScreeningMatch",
     "Shipment",
     "ShipmentStatus",
     "SourceRun",
+    "SubjectType",
     "TokenType",
     "TransportMode",
     "User",

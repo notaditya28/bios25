@@ -8,7 +8,20 @@ import { Alert, Button, DemoBanner, Field, Input, Modal, PageHeader, Select, Tab
 import { api, ApiError } from "@/lib/api";
 import { portLabel } from "@/lib/format";
 import { useSession } from "@/lib/session";
-import type { Company, Page, Partner } from "@/lib/types";
+import type { Company, Page, Partner, SubjectScreening } from "@/lib/types";
+
+function ScreeningBadge({ s }: { s: SubjectScreening | undefined }) {
+  if (!s) return <span className="text-xs text-slate-500">Not screened yet</span>;
+  if (s.confirmed > 0)
+    return <span className="rounded bg-red-100 px-2 py-0.5 text-xs font-semibold text-red-800">Sanctioned match</span>;
+  if (s.pending > 0)
+    return (
+      <a href="/app/screening" className="rounded bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-900 underline">
+        {s.pending} to review
+      </a>
+    );
+  return <span className="rounded bg-emerald-50 px-2 py-0.5 text-xs text-emerald-800">Clear</span>;
+}
 
 type Form = {
   kind: "buyer" | "supplier";
@@ -109,12 +122,16 @@ function Partners({ company }: { company: Company }) {
   const [q, setQ] = useState("");
   const [editing, setEditing] = useState<Partner | "new" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [screening, setScreening] = useState<Record<string, SubjectScreening>>({});
 
   const load = useCallback(() => {
     api<Page<Partner>>(base, { query: { company_id: company.id, q, limit: 200 } })
       .then(setData)
       .catch((e) => setError(e.message));
-  }, [base, company.id, q]);
+    api<SubjectScreening[]>(`/orgs/${org.organization_id}/screening/subjects`, { query: { subject_type: "partner" } })
+      .then((rows) => setScreening(Object.fromEntries(rows.map((r) => [r.subject_id, r]))))
+      .catch(() => undefined);
+  }, [base, company.id, q, org.organization_id]);
   useEffect(load, [load]);
 
   const toBody = (f: Form) => ({
@@ -134,7 +151,7 @@ function Partners({ company }: { company: Company }) {
       {error && <Alert>{error}</Alert>}
       <DemoBanner show={!!data?.items.some((p) => p.is_demo)} />
       <div className="mt-3">
-        <Table head={["Name", "Type", "Country", "City", "Port", ""]} empty={data?.items.length === 0}>
+        <Table head={["Name", "Type", "Country", "City", "Port", "Screening", ""]} empty={data?.items.length === 0}>
           {data?.items.map((p) => (
             <tr key={p.id}>
               <td className="px-3 py-2 font-medium">{p.name}</td>
@@ -142,6 +159,7 @@ function Partners({ company }: { company: Company }) {
               <td className="px-3 py-2">{p.country}</td>
               <td className="px-3 py-2">{p.city ?? "—"}</td>
               <td className="px-3 py-2">{portLabel(p.port)}</td>
+              <td className="px-3 py-2"><ScreeningBadge s={screening[p.id]} /></td>
               <td className="space-x-2 whitespace-nowrap px-3 py-2 text-right">
                 <Button variant="secondary" onClick={() => setEditing(p)}>Edit</Button>
                 <Button

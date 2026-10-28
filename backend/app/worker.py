@@ -11,7 +11,7 @@ celery_app = Celery(
     "traderadar",
     broker=settings.redis_url,
     backend=settings.redis_url,
-    include=["app.tasks.email", "app.tasks.ports"],
+    include=["app.tasks.email", "app.tasks.ports", "app.tasks.sanctions"],
 )
 celery_app.conf.update(
     task_acks_late=True,
@@ -28,7 +28,19 @@ celery_app.conf.update(
             "task": "app.tasks.ports.refresh_ports",
             "schedule": crontab(hour=2, minute=17, day_of_week="sun"),
         },
+        # Lists change on publisher schedules (OFAC can publish any business day).
+        "refresh-sanctions-6h": {
+            "task": "app.tasks.sanctions.refresh_sanctions",
+            "schedule": crontab(minute=23, hour="*/6"),
+        },
+        # Safety net: catches subjects whose on-save screening could not be queued.
+        "rescreen-all-daily": {
+            "task": "app.tasks.sanctions.rescreen_all",
+            "schedule": crontab(hour=3, minute=41),
+        },
     },
+    # Tests run tasks inline so API → screening flows can be asserted synchronously.
+    task_always_eager=settings.app_env == "test",
 )
 
 app = celery_app  # `celery -A app.worker` looks for `app`

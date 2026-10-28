@@ -16,6 +16,7 @@ from app.models import (
     Port,
     Shipment,
     ShipmentStatus,
+    SubjectType,
     TransportMode,
     User,
 )
@@ -32,9 +33,11 @@ from app.schemas.trade import (
     ShipmentOut,
     ShipmentPatch,
 )
+from app.screening.service import forget_subject
 from app.services import trade as svc
 from app.services.audit import audit
 from app.services.serialize import lane_out, partner_out, port_out, shipment_out
+from app.tasks.sanctions import request_screening
 
 router = APIRouter(prefix="/api", tags=["trade"])
 
@@ -159,6 +162,7 @@ def create_partner(
         after=body.model_dump(mode="json"),
     )
     _commit(db, "Partner conflicts with an existing record")
+    request_screening(SubjectType.partner, p.id)
     db.refresh(p)
     return partner_out(p)
 
@@ -191,6 +195,7 @@ def update_partner(
         after=body.model_dump(mode="json"),
     )
     _commit(db, "Partner conflicts with an existing record")
+    request_screening(SubjectType.partner, p.id)
     db.refresh(p)
     return partner_out(p)
 
@@ -209,6 +214,7 @@ def delete_partner(
         target_id=p.id,
         before=partner_out(p).model_dump(mode="json"),
     )
+    forget_subject(db, p.id)
     db.delete(p)
     db.commit()
 
@@ -366,6 +372,7 @@ def create_shipment(
         after=body.model_dump(mode="json"),
     )
     _commit(db, "Shipment conflicts with an existing record")
+    request_screening(SubjectType.vessel, s.id)  # no-op (clears) when no vessel is named
     db.refresh(s)
     return shipment_out(s)
 
@@ -399,6 +406,7 @@ def update_shipment(
         after=body.model_dump(mode="json"),
     )
     _commit(db, "Shipment conflicts with an existing record")
+    request_screening(SubjectType.vessel, s.id)  # no-op (clears) when no vessel is named
     db.refresh(s)
     return shipment_out(s)
 
@@ -417,5 +425,6 @@ def delete_shipment(
         target_id=s.id,
         before=shipment_out(s).model_dump(mode="json"),
     )
+    forget_subject(db, s.id)
     db.delete(s)
     db.commit()
