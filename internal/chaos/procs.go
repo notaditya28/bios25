@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -26,7 +27,8 @@ type Procs struct {
 	Bin      string // hydra-broker binary
 	DataRoot string
 	LogDir   string
-	Policies string // signed policy document each broker installs at start ("" = none)
+	Policies string   // signed policy document each broker installs at start ("" = none)
+	Args     []string // extra broker flags (e.g. -coordination global for the baseline)
 
 	mu      sync.Mutex
 	cmds    map[string]*exec.Cmd
@@ -94,6 +96,7 @@ func (p *Procs) Start(id string) error {
 	if p.Policies != "" {
 		args = append(args, "-policies", p.Policies)
 	}
+	args = append(args, p.Args...)
 	cmd := exec.Command(p.Bin, args...)
 	cmd.Stdout, cmd.Stderr = logf, logf
 	if err := cmd.Start(); err != nil {
@@ -168,8 +171,9 @@ func postJSON(addr, path string, in any) error {
 // has a controller.
 func (p *Procs) WaitHealthy(ctx context.Context, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	global := slices.Contains(p.Args, "global") // baseline: one controller for every region
 	for {
-		ok := true
+		ok, anyCtrl := true, false
 		for _, region := range p.Regions() {
 			up, ctrl := 0, false
 			for _, b := range p.Region(region) {
@@ -186,9 +190,13 @@ func (p *Procs) WaitHealthy(ctx context.Context, timeout time.Duration) error {
 				up++
 				ctrl = ctrl || st.IsController
 			}
-			if up >= 2 && !ctrl {
+			anyCtrl = anyCtrl || ctrl
+			if up >= 2 && !ctrl && !global {
 				ok = false
 			}
+		}
+		if global && !anyCtrl {
+			ok = false
 		}
 		if ok {
 			return nil
@@ -285,9 +293,17 @@ func (p *Procs) Leader(topic string, part int) (BrokerRef, bool) {
 	return BrokerRef{}, false
 }
 
-// Controller returns the region's current controller.
+// Controller returns the controller responsible for region: its own (Hydra), or the single
+// global controller wherever it runs (baseline).
 func (p *Procs) Controller(region string) (BrokerRef, bool) {
-	for _, b := range p.Region(region) {
+	if b, ok := p.controllerIn(p.Region(region)); ok {
+		return b, true
+	}
+	return p.controllerIn(p.Brokers())
+}
+
+func (p *Procs) controllerIn(bs []BrokerRef) (BrokerRef, bool) {
+	for _, b := range bs {
 		var st struct {
 			IsController bool `json:"is_controller"`
 		}

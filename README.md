@@ -91,6 +91,13 @@ Invoke-RestMethod -Method Post http://127.0.0.1:9101/admin/v1/net -ContentType a
 .\scripts\hydra.ps1 kill -Region IN                                                            # whole region down
 ```
 
+Hydra vs a naive single-global-controller design, same scenarios side by side (≈8 minutes):
+```powershell
+.\scripts\hydra.ps1 compare          # or: .\bin\hydra-chaos.exe -mode compare
+```
+Latest: Hydra 7/7 PASS, baseline 5/7 — when India is cut off and loses a broker, Hydra fails over
+inside India in 0.6 s; with one global controller India's data stays frozen for the whole fault.
+
 Chaos harness — starts all 9 brokers itself, runs every scenario under load, verifies every
 acknowledged message and the residency audit, prints the results table (≈2 minutes):
 ```powershell

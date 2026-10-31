@@ -287,8 +287,11 @@ reserved status colours, always with an icon and a label.
 3. **Network partition tests** — **done**: `isolate-region` chaos scenario + Go tests for an
    isolated leader (in-region) and an isolated region (global); fencing visible in logs
    (`fenced stale leader`, `stepping down`, `lost contact with a majority of regions`).
-2. Naive baseline mode — a single global controller, implemented as another `Coordinator`
-   so the same chaos run can compare stall time and loss side by side.
+2. Naive baseline mode — **done**: `hydra-broker -coordination global` puts all 9 brokers in one
+   coordination group (one controller for every region, like one stretched cluster); the same
+   binary, same replication, same scenarios. `hydra-chaos -mode compare` runs every scenario on
+   a fresh cluster of each design and writes a side-by-side table (see "Hydra vs a single global
+   controller" below).
 4. Signed segment manifests — **done in Milestone 3** (see Residency enforcement).
 5. Specific, fast errors — `REGION_UNAVAILABLE` with a `reason` (e.g. `region_crashed`,
    `region_isolated`), `NOT_LEADER` with a leader hint, `STALE_EPOCH`, `NOT_ENOUGH_REPLICAS`,
@@ -426,6 +429,7 @@ over loopback don't transfer to WAN deployments.
 | 5 | `hydra-chaos`, all 6 scenarios, real processes (see table below) | all PASS; 0 lost / 0 dups / 0 order violations over ~900k acked messages |
 | 7 | `hydra-chaos` again with signed policies installed (`results/chaos-20261031-183900.md`) | all 6 PASS; 0 lost / 0 dups / 0 order over ~904k acked; audits PASS before/during/after |
 | 7 | `TestSimulatorMatchesCluster` | placement identical; 18/18 writability outcomes agree after killing IN |
+| 7 | `hydra-chaos -mode compare` (`results/compare-20261101-014904.md`) | Hydra 7/7 PASS; single-global-controller baseline 5/7 — isolated region's data frozen 8.5 s vs failover in 0.6 s |
 | 7 | `hydra-bench` (`results/bench.md`) | live p95 57 ms vs 632 ms FIFO; urgent misses 0% vs 100%; crash duplicates 67 vs 587 (median) |
 
 ### Chaos results (Milestone 5, `results/chaos-20261031-162802.md`)
@@ -446,6 +450,36 @@ IN resident stream kept flowing inside IN (counted under "surviving": 15 ms max 
 (kill-zone/kill-region, depending on whether the killed broker led a global partition).
 Slow-link: EU↔IN direct RTT measured 301 ms; EU-led global traffic from IN went via us-3;
 fetch p50 1.1 ms before vs 1.4 ms during the fault.
+
+### Hydra vs a single global controller (`results/compare-20261101-014904.md`)
+Same binary and replication; only the coordination differs (`-coordination global`: one controller
+elected by a majority of all 9 brokers decides every leader in every region). 7 scenarios each,
+0 lost / 0 duplicates in both designs — the difference is availability.
+
+| Scenario | Max stall, surviving data (Hydra / baseline) | Max stall, global topic | Result |
+|---|---|---|---|
+| baseline (no fault) | 22 ms / 200 ms | 27 / 217 ms | PASS / PASS |
+| kill-broker | 25 ms / 8,332 ms* | 84 / 5,094 ms | PASS / FAIL* |
+| kill-zone | 59 ms / 138 ms | 57 / 770 ms | PASS / PASS |
+| kill-region | 47 ms / 81 ms | 229 / 776 ms | PASS / PASS |
+| isolate-region | 52 ms / 134 ms | 156 / 157 ms | PASS / PASS |
+| slow-link | 52 ms / 172 ms | 311 / 308 ms | PASS / PASS |
+| isolate+kill-leader | IN data back in **588 ms** / frozen **8,490 ms** (whole fault) | 163 / 197 ms | PASS / **FAIL** |
+
+- **isolate+kill-leader** (new scenario, fails deterministically for the baseline): cut India off,
+  then kill the leader of India's own topic. India still has 2 of 3 brokers. Hydra's India
+  controller elects a new leader inside India (588 ms); the baseline's controller is on the other
+  side of the cut, so nobody can elect one and India's data stays frozen until the network heals.
+  This is the brief's "an isolated region keeps serving its own data" requirement.
+- \* kill-broker failed for the baseline in 1 of 3 runs: with one controller tracking 9 brokers,
+  controllership churned (epochs 2→36 in one run) and it re-elected the *US* topic's leader while
+  the old one was alive, stalling US 8.3 s. Two repeats passed (surviving stall 375–510 ms, still
+  15–20× Hydra's). We report it as an observed risk, not a deterministic result.
+- Even without faults the global controller costs: surviving stalls ~2–9× higher and lower
+  throughput under faults (5.3–5.7k vs ~11.9k msg/s acknowledged in kill-broker), because every
+  liveness and leader decision depends on a 9-broker lease group spanning regions.
+- Honest note: on a single laptop the "regions" are 0.5 ms apart; on a real WAN a stretched
+  controller would also pay cross-region RTT on every lease renewal and election.
 
 ## Known limitations
 - In-memory index (see above). No retention, compaction or auth.

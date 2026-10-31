@@ -32,10 +32,11 @@ func main() {
 	flowMode := flag.String("flow", "adaptive", "inter-region bandwidth scheduling: adaptive | fifo | fixed")
 	diskMB := flag.Int64("disk-budget-mb", 10240, "storage budget for time-to-full forecasts")
 	noDedup := flag.Bool("no-dedup", false, "disable wire-level payload dedup for cross-region replication")
+	coordination := flag.String("coordination", "region", "region: one controller per region (Hydra); global: ONE controller for every broker (naive baseline, for comparison only)")
 	policies := flag.String("policies", "", "signed policy document to install at start if newer than the stored one (signature is verified)")
 	flag.Parse()
 
-	opts := options{flow: flow.Config{Mode: flow.Mode(*flowMode)}, diskBudget: *diskMB << 20, noDedup: *noDedup, policies: *policies}
+	opts := options{flow: flow.Config{Mode: flow.Mode(*flowMode)}, diskBudget: *diskMB << 20, noDedup: *noDedup, policies: *policies, coordination: *coordination}
 	if err := run(*cfgPath, *id, *dataRoot, seglog.Config{SegmentBytes: *segBytes, Fsync: *fsync}, opts); err != nil {
 		slog.Error("broker failed", "err", err)
 		os.Exit(1)
@@ -47,6 +48,10 @@ type options struct {
 	diskBudget int64
 	noDedup    bool
 	policies   string
+	// coordination "global" puts every broker of every region in one coordination group: a
+	// single controller elects leaders for all regions, like one stretched cluster. It exists
+	// only as the baseline the chaos harness compares Hydra against.
+	coordination string
 }
 
 func run(cfgPath, id, dataRoot string, logCfg seglog.Config, opts options) error {
@@ -69,8 +74,16 @@ func run(cfgPath, id, dataRoot string, logCfg seglog.Config, opts options) error
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)).With("broker", id, "region", region.Name))
 
 	peers := map[string]string{}
-	for _, p := range region.Brokers {
-		peers[p.ID] = p.Addr
+	for _, r := range cluster.Regions {
+		if r.Name != region.Name && opts.coordination != "global" {
+			continue
+		}
+		for _, p := range r.Brokers {
+			peers[p.ID] = p.Addr
+		}
+	}
+	if opts.coordination != "region" && opts.coordination != "global" {
+		return errors.New("-coordination must be region or global")
 	}
 	directory, addrs := map[string]api.Info{}, map[string]string{}
 	for _, r := range cluster.Regions {

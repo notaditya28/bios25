@@ -54,11 +54,12 @@ type Result struct {
 }
 
 type env struct {
-	p     *Procs
-	opts  Options
-	notes []string
-	lat   *LatencyProbe
-	check func() error // extra pass criterion
+	p       *Procs
+	opts    Options
+	notes   []string
+	lat     *LatencyProbe
+	check   func() error // extra pass criterion
+	streams []*Stream
 }
 
 func (e *env) note(format string, args ...any) {
@@ -112,6 +113,61 @@ func Scenarios() []Scenario {
 			Heal: func(e *env) error { e.p.HealNet(); return nil },
 		},
 		slowLink(),
+		isolateKillLeader(),
+	}
+}
+
+// isolateKillLeader cuts the faulted region off and then kills the leader of its resident
+// partition. The region still has 2 of its 3 brokers, so its own data can and should fail over
+// inside the region — if the region elects its own leaders. With a single global controller on
+// the other side of the cut, nobody can elect a new leader and the region's data freezes.
+func isolateKillLeader() Scenario {
+	var victim BrokerRef
+	return Scenario{
+		Name: "isolate+kill-leader", Description: "cut the faulted region off, then kill the leader of its resident partition", Affected: true,
+		Fault: func(e *env) error {
+			r := e.opts.Faulted
+			topic := strings.ToLower(r) + "-orders"
+			b, ok := e.p.Leader(topic, 0)
+			if !ok {
+				return fmt.Errorf("no leader for %s/0", topic)
+			}
+			victim = b
+			e.p.SetNet(func(a, b BrokerRef) bool { return (a.Region == r) != (b.Region == r) }, nil)
+			time.Sleep(500 * time.Millisecond)
+			e.p.Kill(b.ID)
+			e.note("isolated %s, then killed %s (leader of %s/0); %s still has 2 of 3 brokers", r, b.ID, topic, r)
+			killed := time.Now()
+			// Pass criterion: the region's own data fails over INSIDE the region and is flowing
+			// again before the fault is healed.
+			e.check = func() error {
+				for _, s := range e.streams {
+					if s.Topic != topic {
+						continue
+					}
+					if last := s.LastAck(); last.After(killed) && time.Since(last) < time.Second {
+						e.note("%s resumed inside the isolated region before the heal", topic)
+						return nil
+					}
+					return fmt.Errorf("%s did not fail over inside the isolated region (no acknowledgement in the last second of the fault)", topic)
+				}
+				return fmt.Errorf("no stream for %s", topic)
+			}
+			return nil
+		},
+		Heal: func(e *env) error {
+			if err := e.p.Start(victim.ID); err != nil {
+				return err
+			}
+			e.p.HealNet()
+			go func() { // a restarted broker comes up with a clean network
+				for range 6 {
+					time.Sleep(500 * time.Millisecond)
+					e.p.HealNet()
+				}
+			}()
+			return nil
+		},
 	}
 }
 
@@ -279,6 +335,7 @@ func RunScenario(ctx context.Context, p *Procs, sc Scenario, opts Options) (*Res
 		probes = append(probes, &Probe{Topic: strings.ToLower(r) + "-orders", Region: r, Via: via})
 	}
 
+	e.streams = streams
 	lctx, stop := context.WithCancel(ctx)
 	var wg sync.WaitGroup
 	for _, s := range streams {

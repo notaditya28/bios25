@@ -7,11 +7,12 @@
 #   .\scripts\hydra.ps1 status                 show which brokers are running
 #   .\scripts\hydra.ps1 demo                   build, start all 9 brokers + load + dashboard (one command)
 #   .\scripts\hydra.ps1 chaos                  build and run every chaos scenario, print the results table
+#   .\scripts\hydra.ps1 compare                the same scenarios against Hydra AND a single-global-controller baseline
 #
 # Logs go to data\logs\<id>.log, pids to data\pids\<id>.pid.
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet("start", "stop", "kill", "restart", "status", "demo", "chaos")]
+    [ValidateSet("start", "stop", "kill", "restart", "status", "demo", "chaos", "compare")]
     [string]$Action,
     [string]$Region = "",
     [string]$Id = "",
@@ -68,6 +69,14 @@ switch ($Action) {
         if ($LASTEXITCODE -ne 0) { exit 1 }
         Write-Host "running every chaos scenario (about 2-3 minutes; progress log: hydra-chaos.log)..."
         $p = Start-Process -FilePath .\bin\hydra-chaos.exe -ArgumentList "-config", $Config `
+            -NoNewWindow -PassThru -Wait -RedirectStandardError hydra-chaos.log
+        exit $p.ExitCode
+    }
+    "compare" {
+        go build -o bin/ ./cmd/...
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        Write-Host "running every scenario against Hydra, then against a single global controller (about 8 minutes; log: hydra-chaos.log)..."
+        $p = Start-Process -FilePath .\bin\hydra-chaos.exe -ArgumentList "-config", $Config, "-mode", "compare" `
             -NoNewWindow -PassThru -Wait -RedirectStandardError hydra-chaos.log
         exit $p.ExitCode
     }
