@@ -8,3 +8,4 @@
 /configs/policy-admin.key
 /configs/policies.signed.json
 /configs/policy-admin.pub
+/data-dash/
