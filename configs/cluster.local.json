@@ -1,0 +1,28 @@
+{
+  "regions": [
+    {
+      "name": "IN",
+      "brokers": [
+        {"id": "in-1", "zone": "in-a", "addr": "127.0.0.1:9101"},
+        {"id": "in-2", "zone": "in-b", "addr": "127.0.0.1:9102"},
+        {"id": "in-3", "zone": "in-c", "addr": "127.0.0.1:9103"}
+      ]
+    },
+    {
+      "name": "EU",
+      "brokers": [
+        {"id": "eu-1", "zone": "eu-a", "addr": "127.0.0.1:9201"},
+        {"id": "eu-2", "zone": "eu-b", "addr": "127.0.0.1:9202"},
+        {"id": "eu-3", "zone": "eu-c", "addr": "127.0.0.1:9203"}
+      ]
+    },
+    {
+      "name": "US",
+      "brokers": [
+        {"id": "us-1", "zone": "us-a", "addr": "127.0.0.1:9301"},
+        {"id": "us-2", "zone": "us-b", "addr": "127.0.0.1:9302"},
+        {"id": "us-3", "zone": "us-c", "addr": "127.0.0.1:9303"}
+      ]
+    }
+  ]
+}
