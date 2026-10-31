@@ -20,10 +20,10 @@ commands:
   info          show broker identity
   topics        list topics
   create-topic  -name NAME -partitions N -residency IN|EU|US|global
-  produce       -topic NAME [-n 10000 -batch 1000 -size 100 -keys] | [-value V -key K]
+  produce       -topic NAME [-n 10000 -batch 1000 -size 100 -keys -retry 10s] | [-value V -key K]
   consume       -topic NAME -partition P [-offset 0 -max 0 -follow -quiet]
 
-every command takes -b HOST:PORT (default 127.0.0.1:9101)`
+every command takes -b HOST:PORT[,HOST:PORT...] (default 127.0.0.1:9101); produce -retry rotates through them`
 
 func main() {
 	if len(os.Args) < 2 {
@@ -62,7 +62,7 @@ func main() {
 		os.Exit(2)
 	}
 	fs.Parse(args)
-	if err := run(context.Background(), client.New(*addr)); err != nil {
+	if err := run(context.Background(), client.New(strings.Split(*addr, ",")[0])); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -85,14 +85,20 @@ func produceCmd(fs *flag.FlagSet) func(context.Context, *client.Client) error {
 	keys := fs.Bool("keys", false, "give each message a key (spreads across partitions by hash)")
 	value := fs.String("value", "", "produce a single message with this value instead")
 	key := fs.String("key", "", "key for -value")
+	retry := fs.Duration("retry", 0, "keep retrying a failed batch for up to this long, rotating through -b brokers")
 	return func(ctx context.Context, c *client.Client) error {
 		if *value != "" {
 			resp, err := c.Produce(ctx, *topic, []api.ProduceRecord{{Key: *key, Value: *value}})
 			return printJSON(resp, err)
 		}
+		var clients []*client.Client
+		for _, a := range strings.Split(fs.Lookup("b").Value.String(), ",") {
+			clients = append(clients, client.New(a))
+		}
 		pad := strings.Repeat("x", max(*size, 0))
 		start := time.Now()
-		for sent := 0; sent < *n; {
+		lastAck, maxStall, failures := start, time.Duration(0), 0
+		for sent, attempt := 0, 0; sent < *n; {
 			recs := make([]api.ProduceRecord, min(*batch, *n-sent))
 			for i := range recs {
 				v := fmt.Sprintf("msg-%d-", sent+i)
@@ -104,14 +110,27 @@ func produceCmd(fs *flag.FlagSet) func(context.Context, *client.Client) error {
 					recs[i].Key = fmt.Sprintf("k%d", sent+i)
 				}
 			}
-			if _, err := c.Produce(ctx, *topic, recs); err != nil {
-				return fmt.Errorf("after %d messages: %w", sent, err)
+			for {
+				_, err := clients[attempt%len(clients)].Produce(ctx, *topic, recs)
+				if err == nil {
+					break
+				}
+				failures++
+				if time.Since(lastAck) > *retry {
+					return fmt.Errorf("after %d messages: %w", sent, err)
+				}
+				fmt.Fprintf(os.Stderr, "retrying after error: %v\n", err)
+				attempt++
+				time.Sleep(50 * time.Millisecond)
 			}
+			now := time.Now()
+			maxStall, lastAck = max(maxStall, now.Sub(lastAck)), now
 			sent += len(recs)
 		}
 		el := time.Since(start)
-		fmt.Printf("produced %d messages in %v: %.0f msg/s, %.1f MB/s\n",
-			*n, el.Round(time.Millisecond), float64(*n)/el.Seconds(), float64(*n**size)/el.Seconds()/1e6)
+		fmt.Printf("produced %d messages in %v: %.0f msg/s, %.1f MB/s; failed attempts %d, max stall %v\n",
+			*n, el.Round(time.Millisecond), float64(*n)/el.Seconds(), float64(*n**size)/el.Seconds()/1e6,
+			failures, maxStall.Round(time.Millisecond))
 		return nil
 	}
 }

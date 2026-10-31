@@ -11,15 +11,21 @@ type Record struct {
 	Offset    uint64
 	Epoch     uint64 // leader epoch that wrote the record; used to truncate divergent tails after failover
 	Timestamp int64  // unix milliseconds
+	Flags     uint8
 	Key       []byte
 	Value     []byte
 }
 
+// FlagControl marks internal records (e.g. the marker a new leader writes); consumers skip them.
+const FlagControl uint8 = 1
+
+func (r *Record) IsControl() bool { return r.Flags&FlagControl != 0 }
+
 // On-disk framing: u32 body length | u32 CRC32-C(body) | body
-// body: u64 offset | u64 epoch | i64 timestamp | u32 keylen | key | u32 vallen | value
+// body: u64 offset | u64 epoch | i64 timestamp | u8 flags | u32 keylen | key | u32 vallen | value
 const (
 	headerSize    = 8
-	fixedBodySize = 8 + 8 + 8 + 4 + 4
+	fixedBodySize = 8 + 8 + 8 + 1 + 4 + 4
 
 	// MaxRecordSize bounds len(key)+len(value) of a single record.
 	MaxRecordSize = 8 << 20
@@ -43,6 +49,7 @@ func appendEncoded(dst []byte, r *Record) []byte {
 	dst = be.AppendUint64(dst, r.Offset)
 	dst = be.AppendUint64(dst, r.Epoch)
 	dst = be.AppendUint64(dst, uint64(r.Timestamp))
+	dst = append(dst, r.Flags)
 	dst = be.AppendUint32(dst, uint32(len(r.Key)))
 	dst = append(dst, r.Key...)
 	dst = be.AppendUint32(dst, uint32(len(r.Value)))
@@ -60,8 +67,9 @@ func decodeBody(body []byte) (Record, error) {
 		Offset:    be.Uint64(body[0:]),
 		Epoch:     be.Uint64(body[8:]),
 		Timestamp: int64(be.Uint64(body[16:])),
+		Flags:     body[24],
 	}
-	p := 24
+	p := 25
 	kl := int(be.Uint32(body[p:]))
 	p += 4
 	if kl > len(body)-p-4 {

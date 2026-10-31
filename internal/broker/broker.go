@@ -1,16 +1,19 @@
-// Package broker implements api.Service on top of per-partition segment logs.
+// Package broker implements api.Service for one broker in a region: it routes produce and
+// fetch to partition leaders, and (when it holds the controller lease) places topics and
+// elects partition leaders.
 package broker
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -18,14 +21,23 @@ import (
 	"time"
 
 	"github.com/notaditya28/hydra-stream/internal/api"
+	"github.com/notaditya28/hydra-stream/internal/coord"
+	"github.com/notaditya28/hydra-stream/internal/fsutil"
+	"github.com/notaditya28/hydra-stream/internal/meta"
+	"github.com/notaditya28/hydra-stream/internal/replica"
+	"github.com/notaditya28/hydra-stream/internal/rpc"
 	"github.com/notaditya28/hydra-stream/internal/seglog"
+	"github.com/notaditya28/hydra-stream/internal/transport/httpapi"
 )
 
 const (
 	identityFile  = "broker.json"
-	topicsDir     = "topics"
-	topicMetaFile = "topic.json"
+	coordFile     = "coord.json"
 	maxPartitions = 256
+
+	pathProduce = "/internal/v1/broker/produce"
+	pathFetch   = "/internal/v1/broker/fetch"
+	pathCreate  = "/internal/v1/broker/create-topic"
 )
 
 // Lower-case only: topic names are directory names and Windows/macOS file systems are case-insensitive.
@@ -34,53 +46,93 @@ var topicName = regexp.MustCompile(`^[a-z0-9._-]{1,128}$`)
 type Config struct {
 	Info    api.Info
 	DataDir string
-	Regions []string // regions in the cluster; a resident topic must name one of these
+	Regions []string          // regions in the cluster; a resident topic must name one of these
+	Peers   map[string]string // id -> addr of every broker in our region, including us
 	Log     seglog.Config
+	Coord   coord.Timing
+	Replica replica.Timing
+	Net     *rpc.Net // optional; shared link blocker for partition simulation
 }
 
 type Broker struct {
 	cfg     Config
 	regions map[string]bool
+	peers   []string // sorted ids in our region
+	net     *rpc.Net
+	rpc     *rpc.Client
+	coord   coord.Coordinator
+	parts   *replica.Manager
 
-	mu     sync.RWMutex
-	topics map[string]*topic
+	rrMu sync.Mutex
+	rr   map[string]*atomic.Uint64
+
+	ctrlMu   sync.Mutex
+	maxEpoch map[meta.PartKey]uint64 // controller: highest epoch seen while fencing
+
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
-type topic struct {
-	cfg   api.TopicConfig
-	parts []*seglog.Log
-	rr    atomic.Uint64 // round-robin cursor for keyless records
-}
-
-// identity is persisted in the data dir so a dir can't be reused by another broker or region.
 type identity struct {
 	ID     string `json:"id"`
 	Region string `json:"region"`
 	Zone   string `json:"zone"`
 }
 
-type topicMeta struct {
-	api.TopicConfig
-	CreatedAt time.Time `json:"created_at"`
-}
-
-// Open opens (or initialises) the broker's data directory and loads existing topics.
+// Open initialises the data directory and the broker's components. Call Start to run it.
 func Open(cfg Config) (*Broker, error) {
 	if cfg.Info.ID == "" || cfg.Info.Region == "" {
 		return nil, errors.New("broker: id and region are required")
 	}
-	if err := os.MkdirAll(filepath.Join(cfg.DataDir, topicsDir), 0o755); err != nil {
+	if len(cfg.Peers) == 0 {
+		cfg.Peers = map[string]string{cfg.Info.ID: ""}
+	}
+	if _, ok := cfg.Peers[cfg.Info.ID]; !ok {
+		return nil, fmt.Errorf("broker: %s missing from its own peer list", cfg.Info.ID)
+	}
+	if cfg.Coord == (coord.Timing{}) {
+		cfg.Coord = coord.DefaultTiming()
+	}
+	if cfg.Replica == (replica.Timing{}) {
+		cfg.Replica = replica.DefaultTiming()
+	}
+	if cfg.Net == nil {
+		cfg.Net = rpc.NewNet()
+	}
+	if err := os.MkdirAll(filepath.Join(cfg.DataDir, replica.TopicsDir), 0o755); err != nil {
 		return nil, err
 	}
 	if err := checkIdentity(cfg.DataDir, cfg.Info); err != nil {
 		return nil, err
 	}
-	b := &Broker{cfg: cfg, regions: map[string]bool{}, topics: map[string]*topic{}}
+
+	b := &Broker{
+		cfg: cfg, regions: map[string]bool{}, net: cfg.Net,
+		rr: map[string]*atomic.Uint64{}, maxEpoch: map[meta.PartKey]uint64{},
+	}
 	for _, r := range cfg.Regions {
 		b.regions[r] = true
 	}
-	if err := b.loadTopics(); err != nil {
-		b.Close()
+	for id := range cfg.Peers {
+		b.peers = append(b.peers, id)
+	}
+	sort.Strings(b.peers)
+	b.rpc = rpc.NewClient(cfg.Info.ID, cfg.Peers, cfg.Net)
+	b.parts = replica.NewManager(cfg.Info.ID, cfg.DataDir, cfg.Log, b.rpc, cfg.Replica)
+	lease, err := coord.NewLease(coord.LeaseConfig{
+		Self: cfg.Info.ID, Peers: b.peers, RPC: b.rpc,
+		StateFile: filepath.Join(cfg.DataDir, coordFile),
+		Timing:    cfg.Coord,
+		OnCommit:  b.parts.Apply,
+		Stuck:     b.parts.Stuck,
+	})
+	if err != nil {
+		return nil, err
+	}
+	b.coord = lease
+	// Open replicas we already have so their data is present, but take no role until synced.
+	if err := b.parts.Open(lease.Committed()); err != nil {
+		b.parts.Close()
 		return nil, err
 	}
 	return b, nil
@@ -89,94 +141,62 @@ func Open(cfg Config) (*Broker, error) {
 func checkIdentity(dir string, info api.Info) error {
 	path := filepath.Join(dir, identityFile)
 	want := identity{ID: info.ID, Region: info.Region, Zone: info.Zone}
-	data, err := os.ReadFile(path)
+	var got identity
+	err := fsutil.ReadJSON(path, &got)
 	if errors.Is(err, os.ErrNotExist) {
-		return writeJSONAtomic(path, want)
+		return fsutil.WriteJSONAtomic(path, want)
 	}
 	if err != nil {
-		return err
-	}
-	var got identity
-	if err := json.Unmarshal(data, &got); err != nil {
-		return fmt.Errorf("parse %s: %w", path, err)
+		return fmt.Errorf("read %s: %w", path, err)
 	}
 	if got.ID != want.ID || got.Region != want.Region {
 		return fmt.Errorf("data dir %s belongs to broker %s in region %s, refusing to start as %s in %s",
 			dir, got.ID, got.Region, want.ID, want.Region)
 	}
 	if got.Zone != want.Zone {
-		return writeJSONAtomic(path, want)
+		return fsutil.WriteJSONAtomic(path, want)
 	}
 	return nil
 }
 
-func (b *Broker) loadTopics() error {
-	root := filepath.Join(b.cfg.DataDir, topicsDir)
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(root, e.Name(), topicMetaFile))
-		if errors.Is(err, os.ErrNotExist) {
-			slog.Warn("topic dir without metadata, skipping", "dir", e.Name())
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		var m topicMeta
-		if err := json.Unmarshal(data, &m); err != nil {
-			return fmt.Errorf("parse topic %s: %w", e.Name(), err)
-		}
-		t, err := b.openTopic(m.TopicConfig)
-		if err != nil {
-			return err
-		}
-		b.topics[m.Name] = t
-	}
-	return nil
+// Handler serves the public API, internal broker-to-broker RPCs and admin endpoints.
+func (b *Broker) Handler() http.Handler {
+	mux := http.NewServeMux()
+	httpapi.Register(mux, b)
+	b.coord.Register(mux)
+	b.parts.Register(mux)
+	rpc.Handle(mux, pathProduce, b.handleProduce)
+	rpc.Handle(mux, pathFetch, b.handleFetch)
+	rpc.Handle(mux, pathCreate, b.handleCreate)
+	b.registerAdmin(mux)
+	return b.net.Middleware(mux)
 }
 
-func (b *Broker) openTopic(cfg api.TopicConfig) (*topic, error) {
-	t := &topic{cfg: cfg}
-	for p := 0; p < cfg.Partitions; p++ {
-		l, err := seglog.Open(b.partitionDir(cfg.Name, p), b.cfg.Log)
-		if err != nil {
-			for _, o := range t.parts {
-				o.Close()
-			}
-			return nil, fmt.Errorf("open %s/%d: %w", cfg.Name, p, err)
-		}
-		t.parts = append(t.parts, l)
-	}
-	return t, nil
-}
-
-func (b *Broker) partitionDir(topic string, p int) string {
-	return filepath.Join(b.cfg.DataDir, topicsDir, topic, fmt.Sprint(p))
+// Start runs the coordinator and controller loops.
+func (b *Broker) Start() {
+	ctx, cancel := context.WithCancel(context.Background())
+	b.cancel = cancel
+	b.wg.Add(2)
+	go func() { defer b.wg.Done(); b.coord.Run(ctx) }()
+	go func() { defer b.wg.Done(); b.runController(ctx) }()
 }
 
 func (b *Broker) Close() error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	var errs []error
-	for _, t := range b.topics {
-		for _, l := range t.parts {
-			errs = append(errs, l.Close())
-		}
+	if b.cancel != nil {
+		b.cancel()
+		b.wg.Wait()
 	}
-	return errors.Join(errs...)
+	return b.parts.Close()
 }
 
-func (b *Broker) Info() api.Info { return b.cfg.Info }
+func (b *Broker) Info() api.Info                 { return b.cfg.Info }
+func (b *Broker) Net() *rpc.Net                  { return b.net }
+func (b *Broker) Coordinator() coord.Coordinator { return b.coord }
+func (b *Broker) Replicas() *replica.Manager     { return b.parts }
 
 func (b *Broker) normalise(cfg api.TopicConfig) (api.TopicConfig, error) {
 	if !topicName.MatchString(cfg.Name) || cfg.Name == "." || cfg.Name == ".." {
-		return cfg, api.Errorf(api.CodeInvalidRequest, "invalid topic name %q", cfg.Name)
+		return cfg, api.Errorf(api.CodeInvalidRequest, "invalid topic name %q (lower-case letters, digits, . _ -)", cfg.Name)
 	}
 	if cfg.Partitions < 1 || cfg.Partitions > maxPartitions {
 		return cfg, api.Errorf(api.CodeInvalidRequest, "partitions must be 1..%d", maxPartitions)
@@ -193,86 +213,167 @@ func (b *Broker) normalise(cfg api.TopicConfig) (api.TopicConfig, error) {
 	return cfg, nil
 }
 
-func (b *Broker) CreateTopic(_ context.Context, cfg api.TopicConfig) (api.TopicInfo, error) {
+func (b *Broker) controllerOrUnavailable() (string, error) {
+	id, _ := b.coord.Controller()
+	if id == "" || (id == b.cfg.Info.ID && !b.coord.IsController()) {
+		e := api.Errorf(api.CodeRegionUnavailable, "region %s has no controller (needs a majority of its brokers)", b.cfg.Info.Region)
+		e.Reason = "no_controller"
+		return "", e
+	}
+	return id, nil
+}
+
+func (b *Broker) CreateTopic(ctx context.Context, cfg api.TopicConfig) (api.TopicInfo, error) {
 	cfg, err := b.normalise(cfg)
 	if err != nil {
 		return api.TopicInfo{}, err
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if t, ok := b.topics[cfg.Name]; ok {
-		if t.cfg != cfg {
-			return api.TopicInfo{}, api.Errorf(api.CodeTopicExists,
-				"topic %q exists with partitions=%d residency=%s", cfg.Name, t.cfg.Partitions, t.cfg.Residency)
+	if cfg.Residency != api.ResidencyGlobal && cfg.Residency != b.cfg.Info.Region {
+		e := api.Errorf(api.CodeResidencyViolation, "topic %q is resident in %s and cannot be placed in region %s",
+			cfg.Name, cfg.Residency, b.cfg.Info.Region)
+		e.Reason = "wrong_region"
+		return api.TopicInfo{}, e
+	}
+	if b.coord.IsController() {
+		if _, err := b.createAsController(ctx, cfg); err != nil {
+			return api.TopicInfo{}, err
 		}
-		return t.info(), nil
+	} else {
+		ctrl, err := b.controllerOrUnavailable()
+		if err != nil {
+			return api.TopicInfo{}, err
+		}
+		if err := b.rpc.Call(ctx, ctrl, pathCreate, cfg, &struct{}{}); err != nil {
+			return api.TopicInfo{}, asUnavailable(err, ctrl)
+		}
 	}
-	// Metadata is written first so no partition data ever exists without a residency tag.
-	dir := filepath.Join(b.cfg.DataDir, topicsDir, cfg.Name)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return api.TopicInfo{}, err
+	// Wait until our own committed metadata includes the topic.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		info, err := b.Topic(ctx, cfg.Name)
+		if err == nil || time.Now().After(deadline) {
+			return info, err
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if err := writeJSONAtomic(filepath.Join(dir, topicMetaFile), topicMeta{cfg, time.Now().UTC()}); err != nil {
-		return api.TopicInfo{}, err
-	}
-	t, err := b.openTopic(cfg)
-	if err != nil {
-		return api.TopicInfo{}, err
-	}
-	b.topics[cfg.Name] = t
-	slog.Info("topic created", "topic", cfg.Name, "partitions", cfg.Partitions, "residency", cfg.Residency)
-	return t.info(), nil
 }
 
-func (t *topic) info() api.TopicInfo {
-	info := api.TopicInfo{TopicConfig: t.cfg, PartitionStates: make([]api.PartitionInfo, len(t.parts))}
-	for p, l := range t.parts {
-		info.PartitionStates[p] = api.PartitionInfo{Partition: p, LogStart: l.StartOffset(), HighWatermark: l.EndOffset()}
+func (b *Broker) handleCreate(ctx context.Context, cfg *api.TopicConfig) (*struct{}, error) {
+	if !b.coord.IsController() {
+		return nil, api.Errorf(api.CodeNotLeader, "%s is not the controller", b.cfg.Info.ID)
+	}
+	_, err := b.createAsController(ctx, *cfg)
+	return &struct{}{}, err
+}
+
+var errNoChange = errors.New("no change")
+
+func (b *Broker) createAsController(ctx context.Context, cfg api.TopicConfig) (*meta.Metadata, error) {
+	live := b.coord.Live()
+	quorum := len(b.peers)/2 + 1
+	if len(live) < quorum {
+		return nil, api.Errorf(api.CodeNotEnoughReplicas, "only %d of %d brokers live", len(live), len(b.peers))
+	}
+	md, err := b.coord.Propose(ctx, func(m *meta.Metadata) error {
+		if t, ok := m.Topics[cfg.Name]; ok {
+			if t.Config != cfg {
+				return api.Errorf(api.CodeTopicExists, "topic %q exists with partitions=%d residency=%s",
+					cfg.Name, t.Config.Partitions, t.Config.Residency)
+			}
+			return errNoChange
+		}
+		t := &meta.TopicMeta{Config: cfg}
+		for p := 0; p < cfg.Partitions; p++ {
+			// Rotate replica order so preferred leaders spread across zones.
+			replicas := make([]string, len(b.peers))
+			for i := range b.peers {
+				replicas[i] = b.peers[(p+i)%len(b.peers)]
+			}
+			leader := ""
+			for _, r := range replicas {
+				if live[r] {
+					leader = r
+					break
+				}
+			}
+			t.Partitions = append(t.Partitions, meta.PartitionMeta{Replicas: replicas, Leader: leader, LeaderEpoch: 1})
+		}
+		m.Topics[cfg.Name] = t
+		return nil
+	})
+	if errors.Is(err, errNoChange) {
+		return b.coord.Committed(), nil
+	}
+	if errors.Is(err, coord.ErrNotController) {
+		return nil, api.Errorf(api.CodeRegionUnavailable, "lost the controller lease")
+	}
+	if err == nil {
+		slog.Info("topic created", "topic", cfg.Name, "partitions", cfg.Partitions, "residency", cfg.Residency)
+	}
+	return md, err
+}
+
+func (b *Broker) topicInfo(t *meta.TopicMeta) api.TopicInfo {
+	info := api.TopicInfo{TopicConfig: t.Config, PartitionStates: make([]api.PartitionInfo, len(t.Partitions))}
+	for i, pm := range t.Partitions {
+		pi := api.PartitionInfo{Partition: i, Leader: pm.Leader, LeaderEpoch: pm.LeaderEpoch, Replicas: pm.Replicas}
+		if p := b.parts.Get(meta.PartKey{Topic: t.Config.Name, Partition: i}); p != nil {
+			st := p.Status()
+			pi.LogStart, pi.HighWatermark = p.Log().StartOffset(), st.HW
+		}
+		info.PartitionStates[i] = pi
 	}
 	return info
 }
 
 func (b *Broker) Topics(context.Context) ([]api.TopicInfo, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	out := make([]api.TopicInfo, 0, len(b.topics))
-	for _, t := range b.topics {
-		out = append(out, t.info())
+	md := b.coord.Committed()
+	out := make([]api.TopicInfo, 0, len(md.Topics))
+	for _, t := range md.Topics {
+		out = append(out, b.topicInfo(t))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
 }
 
 func (b *Broker) Topic(_ context.Context, name string) (api.TopicInfo, error) {
-	t, err := b.topic(name)
-	if err != nil {
-		return api.TopicInfo{}, err
+	t, ok := b.coord.Committed().Topics[name]
+	if !ok {
+		return api.TopicInfo{}, api.Errorf(api.CodeUnknownTopic, "unknown topic %q", name)
 	}
-	return t.info(), nil
+	return b.topicInfo(t), nil
 }
 
-func (b *Broker) topic(name string) (*topic, error) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	t, ok := b.topics[name]
+func (b *Broker) topicMeta(name string) (*meta.TopicMeta, error) {
+	t, ok := b.coord.Committed().Topics[name]
 	if !ok {
 		return nil, api.Errorf(api.CodeUnknownTopic, "unknown topic %q", name)
 	}
 	return t, nil
 }
 
-func (b *Broker) Produce(_ context.Context, req api.ProduceRequest) (api.ProduceResponse, error) {
-	t, err := b.topic(req.Topic)
+func (b *Broker) sticky(topic string, n int) int {
+	b.rrMu.Lock()
+	c, ok := b.rr[topic]
+	if !ok {
+		c = &atomic.Uint64{}
+		b.rr[topic] = c
+	}
+	b.rrMu.Unlock()
+	return int(c.Add(1) % uint64(n))
+}
+
+func (b *Broker) Produce(ctx context.Context, req api.ProduceRequest) (api.ProduceResponse, error) {
+	t, err := b.topicMeta(req.Topic)
 	if err != nil {
 		return api.ProduceResponse{}, err
 	}
 	if len(req.Records) == 0 || len(req.Records) > api.MaxProduceRecords {
 		return api.ProduceResponse{}, api.Errorf(api.CodeInvalidRequest, "a produce request needs 1..%d records", api.MaxProduceRecords)
 	}
-
-	n := len(t.parts)
-	sticky := int(t.rr.Add(1) % uint64(n))
-	groups := make(map[int][]int)
+	n := len(t.Partitions)
+	sticky := b.sticky(req.Topic, n)
+	groups := map[int][]int{}
 	var order []int
 	for i, r := range req.Records {
 		var p int
@@ -296,87 +397,181 @@ func (b *Broker) Produce(_ context.Context, req api.ProduceRequest) (api.Produce
 	}
 
 	resp := api.ProduceResponse{Offsets: make([]api.RecordOffset, len(req.Records))}
-	for _, p := range order {
-		idx := groups[p]
-		recs := make([]seglog.Record, len(idx))
-		for j, i := range idx {
-			r := req.Records[i]
-			if r.Key != "" {
-				recs[j].Key = []byte(r.Key)
+	errs := make([]error, len(order))
+	var wg sync.WaitGroup
+	for gi, p := range order {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			idx := groups[p]
+			recs := make([]api.ProduceRecord, len(idx))
+			for j, i := range idx {
+				recs[j] = req.Records[i]
 			}
-			recs[j].Value = []byte(r.Value)
-		}
-		base, err := t.parts[p].Append(recs)
-		if errors.Is(err, seglog.ErrRecordTooLarge) {
-			return api.ProduceResponse{}, api.Errorf(api.CodeInvalidRequest, "record larger than %d bytes", seglog.MaxRecordSize)
-		}
+			base, err := b.producePartition(ctx, req.Topic, p, t.Partitions[p].Leader, recs)
+			if err != nil {
+				errs[gi] = err
+				return
+			}
+			for j, i := range idx {
+				resp.Offsets[i] = api.RecordOffset{Partition: p, Offset: base + uint64(j)}
+			}
+		}()
+	}
+	wg.Wait()
+	// Partitions are independent: if one failed, others may have committed (see NOTES.md).
+	for _, err := range errs {
 		if err != nil {
-			return api.ProduceResponse{}, api.Errorf(api.CodeInternal, "append %s/%d: %v", req.Topic, p, err)
-		}
-		for j, i := range idx {
-			resp.Offsets[i] = api.RecordOffset{Partition: p, Offset: base + uint64(j)}
+			return api.ProduceResponse{}, err
 		}
 	}
 	return resp, nil
+}
+
+type partitionProduce struct {
+	Topic     string              `json:"topic"`
+	Partition int                 `json:"partition"`
+	Records   []api.ProduceRecord `json:"records"`
+}
+
+type partitionProduceResp struct {
+	Base uint64 `json:"base"`
+}
+
+func (b *Broker) producePartition(ctx context.Context, topic string, part int, leader string, recs []api.ProduceRecord) (uint64, error) {
+	switch leader {
+	case b.cfg.Info.ID:
+		return b.produceLocal(ctx, topic, part, recs)
+	case "":
+		e := api.Errorf(api.CodeNotEnoughReplicas, "%s/%d has no leader", topic, part)
+		e.Reason = "partition_offline"
+		return 0, e
+	}
+	cctx, cancel := context.WithTimeout(ctx, b.cfg.Replica.ProduceTimeout+b.cfg.Replica.RPCTimeout)
+	defer cancel()
+	var out partitionProduceResp
+	if err := b.rpc.Call(cctx, leader, pathProduce, partitionProduce{topic, part, recs}, &out); err != nil {
+		return 0, asUnavailable(err, leader)
+	}
+	return out.Base, nil
+}
+
+func (b *Broker) produceLocal(ctx context.Context, topic string, part int, recs []api.ProduceRecord) (uint64, error) {
+	p := b.parts.Get(meta.PartKey{Topic: topic, Partition: part})
+	if p == nil {
+		return 0, api.Errorf(api.CodeNotLeader, "%s has no replica of %s/%d", b.cfg.Info.ID, topic, part)
+	}
+	lrecs := make([]seglog.Record, len(recs))
+	for i, r := range recs {
+		if r.Key != "" {
+			lrecs[i].Key = []byte(r.Key)
+		}
+		lrecs[i].Value = []byte(r.Value)
+	}
+	return p.Produce(ctx, lrecs)
+}
+
+func (b *Broker) handleProduce(ctx context.Context, req *partitionProduce) (*partitionProduceResp, error) {
+	base, err := b.produceLocal(ctx, req.Topic, req.Partition, req.Records)
+	if err != nil {
+		return nil, err
+	}
+	return &partitionProduceResp{Base: base}, nil
+}
+
+type partitionFetch struct {
+	Topic      string `json:"topic"`
+	Partition  int    `json:"partition"`
+	Offset     uint64 `json:"offset"`
+	MaxRecords int    `json:"max_records"`
+	MaxBytes   int    `json:"max_bytes"`
+	WaitMs     int64  `json:"wait_ms"`
 }
 
 func (b *Broker) Fetch(ctx context.Context, req api.FetchRequest) (api.FetchResponse, error) {
-	t, err := b.topic(req.Topic)
+	t, err := b.topicMeta(req.Topic)
 	if err != nil {
 		return api.FetchResponse{}, err
 	}
-	if req.Partition < 0 || req.Partition >= len(t.parts) {
+	if req.Partition < 0 || req.Partition >= len(t.Partitions) {
 		return api.FetchResponse{}, api.Errorf(api.CodeUnknownPartition, "topic %q has no partition %d", req.Topic, req.Partition)
 	}
-	l := t.parts[req.Partition]
-	// Milestone 2: the high watermark becomes the quorum-committed offset, not the log end.
-	hw, start := l.EndOffset(), l.StartOffset()
-	if req.Offset < start || req.Offset > hw {
-		return api.FetchResponse{}, api.Errorf(api.CodeOffsetOutOfRange,
-			"offset %d outside [%d, %d] for %s/%d", req.Offset, start, hw, req.Topic, req.Partition)
+	req.MaxRecords = min(req.MaxRecords, api.MaxFetchRecords)
+	req.Wait = min(req.Wait, api.MaxFetchWait)
+	leader := t.Partitions[req.Partition].Leader
+	switch leader {
+	case b.cfg.Info.ID:
+		return b.fetchLocal(ctx, req)
+	case "":
+		e := api.Errorf(api.CodeNotEnoughReplicas, "%s/%d has no leader", req.Topic, req.Partition)
+		e.Reason = "partition_offline"
+		return api.FetchResponse{}, e
 	}
-	if req.Offset == hw && req.Wait > 0 {
-		wctx, cancel := context.WithTimeout(ctx, min(req.Wait, api.MaxFetchWait))
-		_ = l.Wait(wctx, req.Offset) // timing out just means an empty response
-		cancel()
-		hw = l.EndOffset()
+	cctx, cancel := context.WithTimeout(ctx, req.Wait+b.cfg.Replica.RPCTimeout)
+	defer cancel()
+	var out api.FetchResponse
+	in := partitionFetch{req.Topic, req.Partition, req.Offset, req.MaxRecords, req.MaxBytes, req.Wait.Milliseconds()}
+	if err := b.rpc.Call(cctx, leader, pathFetch, in, &out); err != nil {
+		return api.FetchResponse{}, asUnavailable(err, leader)
 	}
-	maxRecs := min(req.MaxRecords, api.MaxFetchRecords)
-	recs, err := l.Read(req.Offset, hw, maxRecs, req.MaxBytes)
-	if err != nil {
-		return api.FetchResponse{}, api.Errorf(api.CodeInternal, "read %s/%d: %v", req.Topic, req.Partition, err)
-	}
-	resp := api.FetchResponse{
-		Topic: req.Topic, Partition: req.Partition, Records: make([]api.FetchedRecord, len(recs)),
-		NextOffset: req.Offset, HighWatermark: hw, LogStart: start,
-	}
-	for i, r := range recs {
-		resp.Records[i] = api.FetchedRecord{Offset: r.Offset, Timestamp: r.Timestamp, Key: string(r.Key), Value: string(r.Value)}
-		resp.NextOffset = r.Offset + 1
-	}
-	return resp, nil
+	return out, nil
 }
 
-func writeJSONAtomic(path string, v any) error {
-	data, err := json.MarshalIndent(v, "", "  ")
+func (b *Broker) fetchLocal(ctx context.Context, req api.FetchRequest) (api.FetchResponse, error) {
+	p := b.parts.Get(meta.PartKey{Topic: req.Topic, Partition: req.Partition})
+	if p == nil {
+		return api.FetchResponse{}, api.Errorf(api.CodeNotLeader, "%s has no replica of %s/%d", b.cfg.Info.ID, req.Topic, req.Partition)
+	}
+	return p.Fetch(ctx, req.Offset, req.MaxRecords, req.MaxBytes, req.Wait)
+}
+
+func (b *Broker) handleFetch(ctx context.Context, req *partitionFetch) (*api.FetchResponse, error) {
+	resp, err := b.fetchLocal(ctx, api.FetchRequest{
+		Topic: req.Topic, Partition: req.Partition, Offset: req.Offset,
+		MaxRecords: req.MaxRecords, MaxBytes: req.MaxBytes, Wait: time.Duration(req.WaitMs) * time.Millisecond,
+	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
+	return &resp, nil
+}
+
+// asUnavailable turns a transport failure reaching peer into a fast, explicit client error.
+func asUnavailable(err error, peer string) error {
+	var e *api.Error
+	if errors.As(err, &e) {
+		return e
 	}
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		return err
+	out := api.Errorf(api.CodeNotLeader, "cannot reach %s: %v", peer, err)
+	out.Reason = "leader_unreachable"
+	out.Leader = peer
+	return out
+}
+
+func (b *Broker) registerAdmin(mux *http.ServeMux) {
+	type netState struct {
+		Blocked []string `json:"blocked"`
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	mux.HandleFunc("GET /admin/v1/net", func(w http.ResponseWriter, r *http.Request) {
+		blocked := b.net.List()
+		slices.Sort(blocked)
+		httpapi.WriteJSON(w, http.StatusOK, netState{Blocked: blocked})
+	})
+	mux.HandleFunc("POST /admin/v1/net", func(w http.ResponseWriter, r *http.Request) {
+		var s netState
+		if !httpapi.Decode(w, r, &s) {
+			return
+		}
+		b.net.Set(s.Blocked)
+		slog.Warn("network links changed", "blocked", s.Blocked)
+		httpapi.WriteJSON(w, http.StatusOK, s)
+	})
+	mux.HandleFunc("GET /admin/v1/status", func(w http.ResponseWriter, r *http.Request) {
+		ctrl, epoch := b.coord.Controller()
+		httpapi.WriteJSON(w, http.StatusOK, map[string]any{
+			"broker": b.cfg.Info, "controller": ctrl, "controller_epoch": epoch,
+			"is_controller": b.coord.IsController(), "synced": b.coord.Synced(),
+			"metadata_version": b.coord.Committed().Version,
+		})
+	})
 }

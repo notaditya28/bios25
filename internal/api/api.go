@@ -38,9 +38,12 @@ type TopicConfig struct {
 }
 
 type PartitionInfo struct {
-	Partition     int    `json:"partition"`
-	LogStart      uint64 `json:"log_start"`
-	HighWatermark uint64 `json:"high_watermark"`
+	Partition     int      `json:"partition"`
+	Leader        string   `json:"leader"`
+	LeaderEpoch   uint64   `json:"leader_epoch"`
+	Replicas      []string `json:"replicas"`
+	LogStart      uint64   `json:"log_start"`
+	HighWatermark uint64   `json:"high_watermark"` // as seen by this broker's replica
 }
 
 type TopicInfo struct {

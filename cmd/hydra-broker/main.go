@@ -17,7 +17,6 @@ import (
 	"github.com/notaditya28/hydra-stream/internal/broker"
 	"github.com/notaditya28/hydra-stream/internal/config"
 	"github.com/notaditya28/hydra-stream/internal/seglog"
-	"github.com/notaditya28/hydra-stream/internal/transport/httpapi"
 )
 
 func main() {
@@ -45,10 +44,15 @@ func run(cfgPath, id, dataRoot string, logCfg seglog.Config) error {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)).With("broker", id, "region", region.Name))
 
+	peers := map[string]string{}
+	for _, p := range region.Brokers {
+		peers[p.ID] = p.Addr
+	}
 	b, err := broker.Open(broker.Config{
 		Info:    api.Info{ID: id, Region: region.Name, Zone: bc.Zone},
 		DataDir: filepath.Join(dataRoot, id),
 		Regions: cluster.RegionNames(),
+		Peers:   peers,
 		Log:     logCfg,
 	})
 	if err != nil {
@@ -56,12 +60,13 @@ func run(cfgPath, id, dataRoot string, logCfg seglog.Config) error {
 	}
 	defer b.Close()
 
-	srv := &http.Server{Addr: bc.Addr, Handler: httpapi.NewHandler(b), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: bc.Addr, Handler: b.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
-	slog.Info("broker listening", "addr", bc.Addr, "zone", bc.Zone)
+	b.Start()
+	slog.Info("broker listening", "addr", bc.Addr, "zone", bc.Zone, "peers", len(peers))
 
 	select {
 	case err := <-errc:
@@ -69,7 +74,7 @@ func run(cfgPath, id, dataRoot string, logCfg seglog.Config) error {
 	case <-ctx.Done():
 	}
 	slog.Info("shutting down")
-	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return srv.Shutdown(sctx)
 }

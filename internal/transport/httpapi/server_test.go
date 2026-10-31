@@ -11,21 +11,27 @@ import (
 	"github.com/notaditya28/hydra-stream/internal/api"
 	"github.com/notaditya28/hydra-stream/internal/broker"
 	"github.com/notaditya28/hydra-stream/internal/client"
-	"github.com/notaditya28/hydra-stream/internal/transport/httpapi"
+	"github.com/notaditya28/hydra-stream/internal/coord"
 )
 
 func setup(t *testing.T) (*client.Client, string) {
 	t.Helper()
+	// A one-broker region: it elects itself controller after one (short) lease period.
 	b, err := broker.Open(broker.Config{
 		Info:    api.Info{ID: "in-1", Region: "IN", Zone: "in-a"},
 		DataDir: t.TempDir(),
 		Regions: []string{"IN", "EU", "US"},
+		Coord:   coord.Timing{LeaseDuration: 200 * time.Millisecond, RenewInterval: 30 * time.Millisecond, FailTimeout: 100 * time.Millisecond, RPCTimeout: 100 * time.Millisecond},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(httpapi.NewHandler(b))
+	srv := httptest.NewServer(b.Handler())
+	b.Start()
 	t.Cleanup(func() { srv.Close(); b.Close() })
+	for !b.Coordinator().IsController() {
+		time.Sleep(10 * time.Millisecond)
+	}
 	return client.New(srv.URL), srv.URL
 }
 
@@ -44,8 +50,10 @@ func TestProduceConsumeOverHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Offsets) != 5000 || resp.Offsets[4999].Offset != 4999 {
-		t.Fatalf("offsets = %d, last %+v", len(resp.Offsets), resp.Offsets[len(resp.Offsets)-1])
+	// Offset 0 holds the leader's (hidden) epoch marker, so user records start at 1.
+	first := resp.Offsets[0].Offset
+	if len(resp.Offsets) != 5000 || resp.Offsets[4999].Offset != first+4999 {
+		t.Fatalf("offsets = %d, first %d, last %+v", len(resp.Offsets), first, resp.Offsets[len(resp.Offsets)-1])
 	}
 
 	var got int
@@ -58,12 +66,12 @@ func TestProduceConsumeOverHTTP(t *testing.T) {
 			break
 		}
 		for _, r := range fr.Records {
-			if r.Offset != off || r.Value != recs[0].Value || r.Key != "k" {
-				t.Fatalf("record %+v at %d", r, off)
+			if r.Offset != first+uint64(got) || r.Value != recs[0].Value || r.Key != "k" {
+				t.Fatalf("record %+v, want offset %d", r, first+uint64(got))
 			}
-			off++
 			got++
 		}
+		off = fr.NextOffset
 	}
 	if got != 5000 {
 		t.Fatalf("consumed %d, want 5000", got)

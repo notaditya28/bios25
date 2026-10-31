@@ -221,6 +221,28 @@ func (l *Log) Read(offset, limit uint64, maxRecords, maxBytes int) ([]Record, er
 	return l.segs[i].read(offset, limit, maxRecords, maxBytes)
 }
 
+// EpochAt returns the leader epoch of the record at offset.
+func (l *Log) EpochAt(offset uint64) (uint64, error) {
+	recs, err := l.Read(offset, offset+1, 1, 1)
+	if err != nil {
+		return 0, err
+	}
+	if len(recs) == 0 {
+		return 0, ErrOffsetOutOfRange
+	}
+	return recs[0].Epoch, nil
+}
+
+// LastEpoch returns the epoch of the last record, or 0 for an empty log.
+func (l *Log) LastEpoch() uint64 {
+	end := l.EndOffset()
+	if end == l.StartOffset() {
+		return 0
+	}
+	e, _ := l.EpochAt(end - 1)
+	return e
+}
+
 // Wait blocks until the log end is beyond offset, the log is closed, or ctx is done.
 func (l *Log) Wait(ctx context.Context, offset uint64) error {
 	l.mu.RLock()
