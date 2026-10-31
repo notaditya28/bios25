@@ -34,6 +34,7 @@ type Manager struct {
 	rpc     *rpc.Client
 	timing  Timing
 	guard   *residency.Guard
+	send    Sender
 
 	mu     sync.RWMutex
 	parts  map[meta.PartKey]*Partition
@@ -41,8 +42,19 @@ type Manager struct {
 }
 
 func NewManager(self, dataDir string, logCfg seglog.Config, client *rpc.Client, timing Timing, guard *residency.Guard) *Manager {
-	return &Manager{self: self, dataDir: dataDir, logCfg: logCfg, rpc: client, timing: timing, guard: guard, parts: map[meta.PartKey]*Partition{}}
+	if timing.ElectionTimeout == 0 {
+		timing.ElectionTimeout = DefaultTiming().ElectionTimeout
+	}
+	return &Manager{self: self, dataDir: dataDir, logCfg: logCfg, rpc: client, timing: timing, guard: guard,
+		send: directSender{client}, parts: map[meta.PartKey]*Partition{}}
 }
+
+// SetSender routes partition traffic (replication, votes) through s, e.g. the geo router.
+func (m *Manager) SetSender(s Sender) { m.send = s }
+
+// selfElected reports whether a partition elects its own leader: global topics span regions,
+// so no region controller may assign their leaders.
+func selfElected(cfg api.TopicConfig) bool { return cfg.Residency == api.ResidencyGlobal }
 
 func (m *Manager) Get(key meta.PartKey) *Partition {
 	m.mu.RLock()
@@ -85,7 +97,7 @@ func (m *Manager) ensure(cfg api.TopicConfig, part int) (*Partition, error) {
 			return nil, err
 		}
 	}
-	p, err := openPartition(layout.PartitionDir(m.dataDir, cfg.Name, part), key, cfg.Residency, m.self, m.logCfg, m.rpc, m.timing, m.guard)
+	p, err := openPartition(layout.PartitionDir(m.dataDir, cfg.Name, part), key, cfg.Residency, m.self, m.logCfg, m.send, m.timing, m.guard)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", key, err)
 	}
@@ -93,15 +105,21 @@ func (m *Manager) ensure(cfg api.TopicConfig, part int) (*Partition, error) {
 	return p, nil
 }
 
-// Open opens every replica assigned to us in md without taking any role (used at startup,
-// before this broker has synced with the controller).
+// Open opens every replica assigned to us in md (used at startup). Region-led replicas take
+// no role until this broker has synced with its controller; self-elected (global) replicas
+// join their elections straight away, which is safe without a controller.
 func (m *Manager) Open(md *meta.Metadata) error {
 	for _, t := range md.Topics {
 		for i, pm := range t.Partitions {
-			if slices.Contains(pm.Replicas, m.self) {
-				if _, err := m.ensure(t.Config, i); err != nil && api.CodeOf(err) != api.CodeResidencyViolation {
-					return err
-				}
+			if !slices.Contains(pm.Replicas, m.self) {
+				continue
+			}
+			p, err := m.ensure(t.Config, i)
+			if err != nil && api.CodeOf(err) != api.CodeResidencyViolation {
+				return err
+			}
+			if p != nil && selfElected(t.Config) {
+				p.startSelfElected(pm.Replicas)
 			}
 		}
 	}
@@ -118,6 +136,10 @@ func (m *Manager) Apply(md *meta.Metadata) {
 			p, err := m.ensure(t.Config, i)
 			if err != nil {
 				slog.Error("open replica", "topic", t.Config.Name, "partition", i, "err", err)
+				continue
+			}
+			if selfElected(t.Config) {
+				p.startSelfElected(pm.Replicas)
 				continue
 			}
 			switch pm.Leader {
@@ -167,6 +189,13 @@ func (m *Manager) Register(mux *http.ServeMux) {
 			return nil, api.Errorf(api.CodeUnknownPartition, "%s has no replica of %s/%d", m.self, req.Topic, req.Partition)
 		}
 		return p.handleAppend(req)
+	})
+	rpc.Handle(mux, PathVote, func(_ context.Context, req *VoteRequest) (*VoteResponse, error) {
+		p := m.Get(meta.PartKey{Topic: req.Topic, Partition: req.Partition})
+		if p == nil {
+			return nil, api.Errorf(api.CodeUnknownPartition, "%s has no replica of %s/%d", m.self, req.Topic, req.Partition)
+		}
+		return p.handleVote(req), nil
 	})
 	rpc.Handle(mux, PathFence, func(_ context.Context, req *FenceRequest) (*FenceResponse, error) {
 		p := m.Get(meta.PartKey{Topic: req.Topic, Partition: req.Partition})

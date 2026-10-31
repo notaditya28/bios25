@@ -24,7 +24,8 @@ var bg = context.Background()
 
 func FastTiming() (coord.Timing, replica.Timing) {
 	return coord.Timing{LeaseDuration: 400 * time.Millisecond, RenewInterval: 50 * time.Millisecond, FailTimeout: 200 * time.Millisecond, RPCTimeout: 150 * time.Millisecond},
-		replica.Timing{Heartbeat: 30 * time.Millisecond, FollowerTimeout: 300 * time.Millisecond, ProduceTimeout: 800 * time.Millisecond, RPCTimeout: 300 * time.Millisecond, MaxBatch: 2000}
+		replica.Timing{Heartbeat: 30 * time.Millisecond, FollowerTimeout: 300 * time.Millisecond, ProduceTimeout: 800 * time.Millisecond,
+			RPCTimeout: 300 * time.Millisecond, MaxBatch: 2000, ElectionTimeout: 250 * time.Millisecond}
 }
 
 type node struct {
@@ -38,9 +39,33 @@ type node struct {
 type cluster struct {
 	t     *testing.T
 	nodes []*node
-	peers map[string]string
+	peers map[string]string            // every broker's address
+	group map[string]map[string]string // broker -> its coordination group (region peers)
 	dir   map[string]api.Info
 	root  string
+}
+
+// newGeo starts a real multi-region cluster: each region its own coordination group.
+func newGeo(t *testing.T, regions []string, perRegion int) *cluster {
+	t.Helper()
+	var all []string
+	for _, r := range regions {
+		for i := 0; i < perRegion; i++ {
+			all = append(all, r)
+		}
+	}
+	return newClusterGroups(t, all, true)
+}
+
+// byRegion returns the indexes of the nodes configured in region.
+func (c *cluster) byRegion(region string) []int {
+	var out []int
+	for i, nd := range c.nodes {
+		if c.dir[nd.id].Region == region {
+			out = append(out, i)
+		}
+	}
+	return out
 }
 
 func newCluster(t *testing.T, n int) *cluster {
@@ -54,10 +79,14 @@ func newCluster(t *testing.T, n int) *cluster {
 // newClusterRegions starts one coordination group whose brokers are configured in the given
 // regions. Mixing regions models a misconfigured peer list.
 func newClusterRegions(t *testing.T, regions []string) *cluster {
+	return newClusterGroups(t, regions, false)
+}
+
+func newClusterGroups(t *testing.T, regions []string, perRegionGroups bool) *cluster {
 	t.Helper()
-	c := &cluster{t: t, peers: map[string]string{}, dir: map[string]api.Info{}, root: t.TempDir()}
+	c := &cluster{t: t, peers: map[string]string{}, group: map[string]map[string]string{}, dir: map[string]api.Info{}, root: t.TempDir()}
 	count := map[string]int{}
-	for i, region := range regions {
+	for _, region := range regions {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -68,7 +97,16 @@ func newClusterRegions(t *testing.T, regions []string) *cluster {
 		ln.Close()
 		c.nodes = append(c.nodes, nd)
 		c.peers[id] = nd.addr
-		c.dir[id] = api.Info{ID: id, Region: region, Zone: fmt.Sprintf("%s-%c", strings.ToLower(region), 'a'+i)}
+		c.dir[id] = api.Info{ID: id, Region: region, Zone: fmt.Sprintf("%s-%c", strings.ToLower(region), 'a'+count[region]-1)}
+	}
+	for _, nd := range c.nodes {
+		g := map[string]string{}
+		for _, other := range c.nodes {
+			if !perRegionGroups || c.dir[other.id].Region == c.dir[nd.id].Region {
+				g[other.id] = other.addr
+			}
+		}
+		c.group[nd.id] = g
 	}
 	for i := range c.nodes {
 		c.start(i)
@@ -87,8 +125,8 @@ func (c *cluster) start(i int) {
 	ct, rt := FastTiming()
 	b, err := Open(Config{
 		Info:    c.dir[nd.id],
-		DataDir: nd.dir, Regions: []string{"IN", "EU", "US"}, Peers: c.peers, Directory: c.dir,
-		Log: seglog.Config{SegmentBytes: 256 << 10}, Coord: ct, Replica: rt, Net: nd.net,
+		DataDir: nd.dir, Regions: []string{"IN", "EU", "US"}, Peers: c.group[nd.id], Addrs: c.peers, Directory: c.dir,
+		Log: seglog.Config{SegmentBytes: 256 << 10}, Coord: ct, Replica: rt, Net: nd.net, Probe: 50 * time.Millisecond,
 	})
 	if err != nil {
 		c.t.Fatal(err)
@@ -285,7 +323,7 @@ func (c *cluster) waitConverged(topic string, part int) {
 		var ref []seglog.Record
 		first := true
 		for _, nd := range c.nodes {
-			if !nd.up {
+			if !nd.up || nd.b.parts.Get(meta.PartKey{Topic: topic, Partition: part}) == nil {
 				continue
 			}
 			recs := localRecords(c.t, nd, topic, part)

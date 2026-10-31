@@ -177,12 +177,59 @@ and forward it to the IN leader — destination legal, but the data passed throu
 now refused at entry. (2) On Windows, directory listings report stale sizes for files another
 process has open, so the audit read 0 bytes; it now stats each segment.
 
-## Global topics under partition (Milestone 4 plan)
-- A global partition has replicas in all 3 regions; writes commit at a majority of regions,
-  leader carries an epoch. An isolated region can't reach a majority, so it rejects global
-  writes fast (explicit error, no hang). No split-brain: the minority side is fenced by epoch.
-- The isolated region keeps serving its own resident topics (all replicas are local).
-- On heal the region truncates to the point of agreement with the current leader and catches up.
+## Multi-region (Milestone 4) — design A: cross-region quorum, no global leader
+**Independent regions.** Each region has its own controller (Milestone 2) and its own metadata.
+Nothing global coordinates regions, so one region's failure can't block another's resident
+traffic. Measured: resident traffic in surviving regions never stalled more than 51 ms when a
+whole region was killed.
+
+**Global topics.** Each global partition has exactly one replica per region, placed by a pure
+function of the cluster config (`globalReplicas`), so every region computes the same placement
+without talking to anyone. Writes commit at 2 of 3 regions.
+- *Leader election without a controller* (`internal/replica/election.go`): the 3 replicas elect
+  their own leader, Raft-style — one vote per epoch (persisted), only for a candidate whose log
+  is at least as up to date. Plus **pre-vote** (an isolated replica can't inflate the epoch and
+  disrupt the healthy leader when it reconnects) and **check-quorum** (a leader that loses
+  contact with a majority of regions steps down, so the isolated side fails fast instead of
+  hanging). Log replication, the commit rule (high watermark + leader marker record) and
+  follower truncation are the same code as in-region partitions.
+- *Creation:* the region that receives the request creates the topic locally, then asks one
+  broker in every other region to create it there; it succeeds once a majority of regions has
+  it, and waits for leaders to be elected so clients can produce at once. Regions that were
+  down or isolated pick up missing global topics from the topic gossip (anti-entropy, every 1 s).
+- *Routing:* any broker accepts a global request; a non-replica hands it to its region's replica,
+  a follower replica forwards to the leader (at most 2 forwards).
+
+**Regional outage behaviour (the trade-off for the pitch)**
+| | crash of region R | R isolated (alive, cut off) |
+|---|---|---|
+| Resident topics of other regions | unaffected | unaffected |
+| Resident topics of R | clients elsewhere get `REGION_UNAVAILABLE (region_unreachable)` in ms; data can't be served elsewhere by law | **keep working inside R** (all replicas local) |
+| Global partitions led in R | re-elected in the other 2 regions (~0.3–0.9 s) | same; R's old leader steps down (check-quorum), writes in R fail fast with `NOT_ENOUGH_REPLICAS (region_isolated)` |
+| On recovery | R's replicas catch up automatically | R rejoins, truncates unacknowledged writes, catches up; no leader disruption thanks to pre-vote |
+
+A client in region X asking for a topic resident in Y gets `WRONG_REGION` with Y's broker
+addresses (relaying it through X would itself break residency). Regions learn which topics
+live where from the probe gossip (topic name + residency + partition count; metadata only).
+
+**Latency-aware routing (`internal/geo`)**
+- Every broker probes every broker in other regions every 200 ms; RTT is an EWMA (α = 0.3).
+  Probe replies carry the responder's RTT table and its region's topic list.
+- For global traffic to broker B, the router compares direct RTT with the best two-hop path
+  via a broker in the third region (our RTT to it + its RTT to B). It relays when that is ≥30%
+  faster *and* saves ≥10 ms, and keeps the relay while it stays ≥10% faster (hysteresis).
+  A down direct link uses any working relay.
+- Relaying is a generic envelope (`/internal/v1/geo/relay`); the relay re-checks residency for
+  itself and the next hop, so resident data can never take a detour. Resident traffic never
+  goes through the router's relay path at all.
+- Slow links are simulated by per-peer delay injection in the RPC layer (`/admin/v1/net`
+  `delays_ms`), added on both request and response. (A separate TCP delay proxy is unnecessary
+  for local runs; the effect on RTT is identical.)
+
+Known flake: once in ~40 runs of the multi-region tests under heavy CPU load, a region's
+controller lost its lease and creating a topic in that region timed out for 10 s. Not
+reproduced since; the create forward now has a timeout and errors are reported. Watch for it
+in chaos runs.
 
 ## Competitive extras (priority order; feature freeze at hour 20)
 1. **Correctness checker** (top priority) — runs alongside chaos tests, records every acknowledged
@@ -218,6 +265,14 @@ process has open, so the audit read 0 bytes; it now stats each segment.
 | 3 | audit ×3 while producing 120k msg/s | PASS every time (≈1.5 s per audit); producer unaffected (max stall 51 ms) |
 | 3 | `TestResidencyEnforcedDespiteMisconfiguredPeers` (EU broker wrongly in IN's group) | IN partitions never placed on, replicated to, relayed through or accepted from it; audit PASS, then FAIL after planting data |
 
+| 4 | 9 processes: create global topic (3 regions, leaders elected) | 396 ms |
+| 4 | produce global from EU, consume from US | 84k msg/s produce, 86k msg/s consume (one partition) |
+| 4 | IN↔EU slowed 150 ms each way (direct RTT measured 297 ms) | EU→IN global traffic re-routed via US; fetch p50 3.1 ms (vs ~300 ms direct) |
+| 4 | kill whole IN region under load (it led the global partition) | EU resident: 0 errors, max stall 51 ms; global: max stall 924 ms, 14 fast errors retried; IN topic via EU → `REGION_UNAVAILABLE` in 55 ms; audit PASS |
+| 4 | tests ×5: region crash | global re-elected in 0.32–0.45 s, max stall ≤ 0.47 s; surviving resident stall ≤ 42 ms; 0 acked loss |
+| 4 | tests ×5: region isolation | resident writes inside isolated region 1–2 ms; global writes there fail in ~1–2 ms (`region_isolated`); majority re-elects (epoch 1→2); converges after heal, unacked writes dropped |
+| 4 | tests ×5: slow link | reroute decided 135–180 ms after the delay starts (≈3 probes) |
+
 ## Known limitations
 - In-memory index (see above). No retention, compaction, consumer groups or auth.
 - Consumers read by explicit offset; no committed consumer offsets (yet).
@@ -229,5 +284,10 @@ process has open, so the audit read 0 bytes; it now stats each segment.
 - Replication is JSON over HTTP (values base64-encoded): simple, not the fastest.
 - Forwarding adds one hop when a client talks to a non-leader; a smart client could route
   straight to leaders.
+- A global partition has one replica per region (3 total), so losing a region *and* a broker
+  holding another region's replica makes that partition unavailable until one returns.
+- Global writes pay a cross-region round trip (leader + fastest other region); reads go to the leader.
+- Global topic creation is not atomic across regions (majority + anti-entropy); conflicting
+  concurrent creates of the same name with different configs are rejected where detected.
 - A region needs 2 of 3 brokers to elect a controller or a leader. With 2 down, the survivor
   keeps serving reads of committed data but rejects writes fast (`NOT_ENOUGH_REPLICAS`).

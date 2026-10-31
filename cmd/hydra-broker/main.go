@@ -48,10 +48,11 @@ func run(cfgPath, id, dataRoot string, logCfg seglog.Config) error {
 	for _, p := range region.Brokers {
 		peers[p.ID] = p.Addr
 	}
-	directory := map[string]api.Info{}
+	directory, addrs := map[string]api.Info{}, map[string]string{}
 	for _, r := range cluster.Regions {
 		for _, p := range r.Brokers {
 			directory[p.ID] = api.Info{ID: p.ID, Region: r.Name, Zone: p.Zone}
+			addrs[p.ID] = p.Addr
 		}
 	}
 	b, err := broker.Open(broker.Config{
@@ -60,6 +61,7 @@ func run(cfgPath, id, dataRoot string, logCfg seglog.Config) error {
 		Regions:   cluster.RegionNames(),
 		Peers:     peers,
 		Directory: directory,
+		Addrs:     addrs,
 		Log:       logCfg,
 	})
 	if err != nil {

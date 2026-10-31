@@ -25,13 +25,58 @@ var (
 	ErrUnknownPeer = errors.New("rpc: unknown peer")
 )
 
-// Net is a set of peers this broker can't talk to (both directions). Empty = healthy network.
+// Net simulates this broker's network links: peers it can't talk to (both directions) and
+// extra one-way delay on calls to a peer (added before the request and before the response
+// is handed back, so a call's round trip grows by 2x the delay). Empty = healthy network.
 type Net struct {
 	mu      sync.RWMutex
 	blocked map[string]bool
+	delays  map[string]time.Duration
 }
 
-func NewNet() *Net { return &Net{blocked: map[string]bool{}} }
+func NewNet() *Net { return &Net{blocked: map[string]bool{}, delays: map[string]time.Duration{}} }
+
+// SetDelays replaces the per-peer one-way delays.
+func (n *Net) SetDelays(d map[string]time.Duration) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.delays = map[string]time.Duration{}
+	for id, v := range d {
+		if v > 0 {
+			n.delays[id] = v
+		}
+	}
+}
+
+func (n *Net) Delay(id string) time.Duration {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.delays[id]
+}
+
+func (n *Net) Delays() map[string]time.Duration {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	out := make(map[string]time.Duration, len(n.delays))
+	for id, v := range n.delays {
+		out[id] = v
+	}
+	return out
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 func (n *Net) Block(ids ...string) {
 	n.mu.Lock()
@@ -119,6 +164,13 @@ func (c *Client) Call(ctx context.Context, peer, path string, in, out any) error
 	addr, ok := c.addrs[peer]
 	if !ok {
 		return fmt.Errorf("%w %q", ErrUnknownPeer, peer)
+	}
+	delay := c.net.Delay(peer)
+	if err := sleepCtx(ctx, delay); err != nil {
+		return err
+	}
+	if delay > 0 {
+		defer sleepCtx(ctx, delay) // the response travels back over the same slow link
 	}
 	data, err := json.Marshal(in)
 	if err != nil {

@@ -24,6 +24,7 @@ import (
 	"github.com/notaditya28/hydra-stream/internal/api"
 	"github.com/notaditya28/hydra-stream/internal/coord"
 	"github.com/notaditya28/hydra-stream/internal/fsutil"
+	"github.com/notaditya28/hydra-stream/internal/geo"
 	"github.com/notaditya28/hydra-stream/internal/layout"
 	"github.com/notaditya28/hydra-stream/internal/manifest"
 	"github.com/notaditya28/hydra-stream/internal/meta"
@@ -42,6 +43,8 @@ const (
 	pathProduce = "/internal/v1/broker/produce"
 	pathFetch   = "/internal/v1/broker/fetch"
 	pathCreate  = "/internal/v1/broker/create-topic"
+	// pathCreateLocal creates a topic in the receiving broker's region only (cross-region fan-out).
+	pathCreateLocal = "/internal/v1/broker/create-topic-local"
 )
 
 // Lower-case only: topic names are directory names and Windows/macOS file systems are case-insensitive.
@@ -55,10 +58,14 @@ type Config struct {
 	// Directory maps every broker id in the cluster to its configured identity. Residency checks
 	// use it to learn which region a broker is in. Defaults to "all peers are in our region".
 	Directory map[string]api.Info
-	Log       seglog.Config
-	Coord     coord.Timing
-	Replica   replica.Timing
-	Net       *rpc.Net // optional; shared link blocker for partition simulation
+	// Addrs maps every broker id in the cluster to its address (for cross-region traffic).
+	// Defaults to Peers.
+	Addrs   map[string]string
+	Log     seglog.Config
+	Coord   coord.Timing
+	Replica replica.Timing
+	Net     *rpc.Net      // optional; shared link blocker / delay injector for chaos tests
+	Probe   time.Duration // inter-region latency probe interval (default 200ms)
 }
 
 type Broker struct {
@@ -71,6 +78,7 @@ type Broker struct {
 	parts   *replica.Manager
 	guard   *residency.Guard
 	key     ed25519.PrivateKey
+	geo     *geo.Router
 
 	rrMu sync.Mutex
 	rr   map[string]*atomic.Uint64
@@ -132,8 +140,17 @@ func Open(cfg Config) (*Broker, error) {
 		b.peers = append(b.peers, id)
 	}
 	sort.Strings(b.peers)
-	b.rpc = rpc.NewClient(cfg.Info.ID, cfg.Peers, cfg.Net)
+	addrs := cfg.Addrs
+	if addrs == nil {
+		addrs = cfg.Peers
+	}
+	b.rpc = rpc.NewClient(cfg.Info.ID, addrs, cfg.Net)
 	b.parts = replica.NewManager(cfg.Info.ID, cfg.DataDir, cfg.Log, b.rpc, cfg.Replica, b.guard)
+	b.geo = geo.New(geo.Config{
+		Self: cfg.Info, Directory: cfg.Directory, RPC: b.rpc, Guard: b.guard, Interval: cfg.Probe,
+		Topics: b.topicSummaries,
+	})
+	b.parts.SetSender(b.geo)
 	lease, err := coord.NewLease(coord.LeaseConfig{
 		Self: cfg.Info.ID, Peers: b.peers, RPC: b.rpc,
 		StateFile: filepath.Join(cfg.DataDir, coordFile),
@@ -183,17 +200,67 @@ func (b *Broker) Handler() http.Handler {
 	rpc.Handle(mux, pathProduce, b.handleProduce)
 	rpc.Handle(mux, pathFetch, b.handleFetch)
 	rpc.Handle(mux, pathCreate, b.handleCreate)
+	rpc.Handle(mux, pathCreateLocal, b.handleCreateLocal)
+	b.geo.Register(mux)
 	b.registerAdmin(mux)
 	return b.net.Middleware(mux)
 }
 
-// Start runs the coordinator and controller loops.
+// Start runs the coordinator, controller and latency-probe loops.
 func (b *Broker) Start() {
 	ctx, cancel := context.WithCancel(context.Background())
 	b.cancel = cancel
-	b.wg.Add(2)
+	b.wg.Add(3)
 	go func() { defer b.wg.Done(); b.coord.Run(ctx) }()
 	go func() { defer b.wg.Done(); b.runController(ctx) }()
+	go func() { defer b.wg.Done(); b.geo.Run(ctx) }()
+}
+
+func (b *Broker) regionNames() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, info := range b.cfg.Directory {
+		if !seen[info.Region] {
+			seen[info.Region] = true
+			out = append(out, info.Region)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (b *Broker) regionBrokers(region string) []string {
+	var out []string
+	for id, info := range b.cfg.Directory {
+		if info.Region == region {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// globalReplicas places a global partition on one broker per region. It is a pure function of
+// the cluster config, so every region computes the same placement without coordinating.
+func (b *Broker) globalReplicas(topic string, p int) []string {
+	h := fnv.New32a()
+	h.Write([]byte(topic))
+	var out []string
+	for _, region := range b.regionNames() {
+		ids := b.regionBrokers(region)
+		out = append(out, ids[(int(h.Sum32()%1024)+p)%len(ids)])
+	}
+	return out
+}
+
+// topicSummaries is what this broker tells other regions about its region's topics.
+func (b *Broker) topicSummaries() []geo.TopicSummary {
+	md := b.coord.Committed()
+	out := make([]geo.TopicSummary, 0, len(md.Topics))
+	for _, t := range md.Topics {
+		out = append(out, geo.TopicSummary{Name: t.Config.Name, Residency: t.Config.Residency, Partitions: t.Config.Partitions})
+	}
+	return out
 }
 
 func (b *Broker) Close() error {
@@ -254,6 +321,85 @@ func (b *Broker) CreateTopic(ctx context.Context, cfg api.TopicConfig) (api.Topi
 	if err != nil {
 		return api.TopicInfo{}, err
 	}
+	info, err := b.createInRegion(ctx, cfg)
+	if err != nil || cfg.Residency != api.ResidencyGlobal {
+		return info, err
+	}
+	// A global topic exists once a majority of regions has it; the others catch up through
+	// topic gossip (see syncGlobalTopics) when they are reachable again.
+	accepted := 1
+	var failed []string
+	for _, region := range b.regionNames() {
+		if region == b.cfg.Info.Region {
+			continue
+		}
+		if err := b.createRemote(ctx, region, cfg); err != nil {
+			if api.CodeOf(err) == api.CodeTopicExists {
+				return api.TopicInfo{}, err
+			}
+			failed = append(failed, region)
+			continue
+		}
+		accepted++
+	}
+	if quorum := len(b.regionNames())/2 + 1; accepted < quorum {
+		e := api.Errorf(api.CodeNotEnoughReplicas, "global topic %q accepted by %d of %d regions (unreachable: %v); it will spread when they return",
+			cfg.Name, accepted, len(b.regionNames()), failed)
+		e.Reason = "regions_unreachable"
+		return api.TopicInfo{}, e
+	}
+	b.waitGlobalLeaders(ctx, cfg.Name, 5*time.Second)
+	return b.Topic(ctx, cfg.Name)
+}
+
+// waitGlobalLeaders waits (bounded) until every partition of a new global topic has elected a
+// leader, so clients can use the topic as soon as creation returns.
+func (b *Broker) waitGlobalLeaders(ctx context.Context, topic string, limit time.Duration) {
+	deadline := time.Now().Add(limit)
+	t, err := b.topicMeta(topic)
+	if err != nil {
+		return
+	}
+	for p := range t.Partitions {
+		for time.Now().Before(deadline) {
+			_, err := b.fetchPartition(ctx, t, api.FetchRequest{Topic: topic, Partition: p, MaxRecords: 1}, 0)
+			if api.CodeOf(err) != api.CodeNotEnoughReplicas && api.CodeOf(err) != api.CodeNotLeader {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+}
+
+// createRemote asks any reachable broker in region to create the topic in its region.
+func (b *Broker) createRemote(ctx context.Context, region string, cfg api.TopicConfig) error {
+	var lastErr error = fmt.Errorf("region %s unreachable", region)
+	for _, id := range b.regionBrokers(region) {
+		if !b.geo.Reachable(id) {
+			continue
+		}
+		cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		err := b.geo.Send(cctx, id, pathCreateLocal, cfg.Name, cfg.Residency, cfg, &struct{}{})
+		cancel()
+		if err == nil || api.CodeOf(err) == api.CodeTopicExists {
+			return err
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+func (b *Broker) handleCreateLocal(ctx context.Context, cfg *api.TopicConfig) (*struct{}, error) {
+	n, err := b.normalise(*cfg)
+	if err != nil {
+		return nil, err
+	}
+	_, err = b.createInRegion(ctx, n)
+	return &struct{}{}, err
+}
+
+// createInRegion creates the topic in this region's metadata (via the region controller).
+func (b *Broker) createInRegion(ctx context.Context, cfg api.TopicConfig) (api.TopicInfo, error) {
 	if err := b.checkRegion(cfg); err != nil {
 		return api.TopicInfo{}, err
 	}
@@ -266,7 +412,10 @@ func (b *Broker) CreateTopic(ctx context.Context, cfg api.TopicConfig) (api.Topi
 		if err != nil {
 			return api.TopicInfo{}, err
 		}
-		if err := b.rpc.Call(ctx, ctrl, pathCreate, cfg, &struct{}{}); err != nil {
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err = b.rpc.Call(cctx, ctrl, pathCreate, cfg, &struct{}{})
+		cancel()
+		if err != nil {
 			return api.TopicInfo{}, asUnavailable(err, ctrl)
 		}
 	}
@@ -304,6 +453,11 @@ func (b *Broker) createAsController(ctx context.Context, cfg api.TopicConfig) (*
 	if len(live) < quorum {
 		return nil, api.Errorf(api.CodeNotEnoughReplicas, "only %d of %d brokers live", len(live), len(b.peers))
 	}
+	if cfg.Residency == api.ResidencyGlobal {
+		return b.proposeTopic(ctx, cfg, func(p int) meta.PartitionMeta {
+			return meta.PartitionMeta{Replicas: b.globalReplicas(cfg.Name, p)} // leader elected by the replicas
+		})
+	}
 	// Placement: only brokers whose configured region satisfies the topic's residency are
 	// eligible, even if the region's peer list were misconfigured to include outsiders.
 	var eligible []string
@@ -321,6 +475,24 @@ func (b *Broker) createAsController(ctx context.Context, cfg api.TopicConfig) (*
 		e.Reason = "no_eligible_brokers"
 		return nil, e
 	}
+	return b.proposeTopic(ctx, cfg, func(p int) meta.PartitionMeta {
+		// Rotate replica order so preferred leaders spread across zones.
+		replicas := make([]string, len(eligible))
+		for i := range eligible {
+			replicas[i] = eligible[(p+i)%len(eligible)]
+		}
+		leader := ""
+		for _, r := range replicas {
+			if live[r] {
+				leader = r
+				break
+			}
+		}
+		return meta.PartitionMeta{Replicas: replicas, Leader: leader, LeaderEpoch: 1}
+	})
+}
+
+func (b *Broker) proposeTopic(ctx context.Context, cfg api.TopicConfig, place func(p int) meta.PartitionMeta) (*meta.Metadata, error) {
 	md, err := b.coord.Propose(ctx, func(m *meta.Metadata) error {
 		if t, ok := m.Topics[cfg.Name]; ok {
 			if t.Config != cfg {
@@ -331,19 +503,7 @@ func (b *Broker) createAsController(ctx context.Context, cfg api.TopicConfig) (*
 		}
 		t := &meta.TopicMeta{Config: cfg}
 		for p := 0; p < cfg.Partitions; p++ {
-			// Rotate replica order so preferred leaders spread across zones.
-			replicas := make([]string, len(eligible))
-			for i := range eligible {
-				replicas[i] = eligible[(p+i)%len(eligible)]
-			}
-			leader := ""
-			for _, r := range replicas {
-				if live[r] {
-					leader = r
-					break
-				}
-			}
-			t.Partitions = append(t.Partitions, meta.PartitionMeta{Replicas: replicas, Leader: leader, LeaderEpoch: 1})
+			t.Partitions = append(t.Partitions, place(p))
 		}
 		m.Topics[cfg.Name] = t
 		return nil
@@ -367,6 +527,9 @@ func (b *Broker) topicInfo(t *meta.TopicMeta) api.TopicInfo {
 		if p := b.parts.Get(meta.PartKey{Topic: t.Config.Name, Partition: i}); p != nil {
 			st := p.Status()
 			pi.LogStart, pi.HighWatermark = p.Log().StartOffset(), st.HW
+			if t.Config.Residency == api.ResidencyGlobal { // self-elected: as this replica sees it
+				pi.Leader, pi.LeaderEpoch = st.Leader, st.LeaderEpoch
+			}
 		}
 		info.PartitionStates[i] = pi
 	}
@@ -394,9 +557,124 @@ func (b *Broker) Topic(_ context.Context, name string) (api.TopicInfo, error) {
 func (b *Broker) topicMeta(name string) (*meta.TopicMeta, error) {
 	t, ok := b.coord.Committed().Topics[name]
 	if !ok {
-		return nil, api.Errorf(api.CodeUnknownTopic, "unknown topic %q", name)
+		return nil, b.unknownTopic(name)
 	}
 	return t, nil
+}
+
+// unknownTopic explains a topic this region doesn't have. A topic resident in another region
+// gets a fast, explicit answer instead of a relay (which residency forbids): WRONG_REGION with
+// that region's brokers, or REGION_UNAVAILABLE if the region can't be reached.
+func (b *Broker) unknownTopic(name string) error {
+	ts, ok := b.geo.TopicHome(name)
+	if !ok || ts.Residency == api.ResidencyGlobal {
+		return api.Errorf(api.CodeUnknownTopic, "unknown topic %q", name)
+	}
+	if !b.geo.RegionReachable(ts.Residency) {
+		e := api.Errorf(api.CodeRegionUnavailable, "topic %q is resident in region %s, which is unreachable; its data cannot be served from elsewhere", name, ts.Residency)
+		e.Reason = "region_unreachable"
+		return e
+	}
+	var addrs []string
+	for _, id := range b.regionBrokers(ts.Residency) {
+		addrs = append(addrs, b.rpc.Addr(id))
+	}
+	e := api.Errorf(api.CodeWrongRegion, "topic %q is resident in region %s; connect to its brokers", name, ts.Residency)
+	e.Reason = "resident_elsewhere"
+	e.Leader = strings.Join(addrs, ",")
+	return e
+}
+
+// targets decides where a request for a partition goes: handled here (local), or forwarded to
+// one of cands (tried in order). hops counts forwards so far; requests are forwarded at most twice
+// (any broker -> its region's replica -> the leader).
+func (b *Broker) targets(t *meta.TopicMeta, part, hops int) (local bool, cands []string, err error) {
+	pm := t.Partitions[part]
+	key := meta.PartKey{Topic: t.Config.Name, Partition: part}
+	if t.Config.Residency != api.ResidencyGlobal {
+		switch pm.Leader {
+		case b.cfg.Info.ID:
+			return true, nil, nil
+		case "":
+			e := api.Errorf(api.CodeNotEnoughReplicas, "%s has no leader", key)
+			e.Reason = "partition_offline"
+			return false, nil, e
+		}
+		if hops >= 2 {
+			return false, nil, api.Errorf(api.CodeNotLeader, "%s: too many forwards", key)
+		}
+		return false, []string{pm.Leader}, nil
+	}
+	// Global partition: the leader is elected by the replicas themselves.
+	if p := b.parts.Get(key); p != nil {
+		st := p.Status()
+		switch {
+		case st.Role == replica.RoleLeader:
+			return true, nil, nil
+		case st.Leader != "" && hops < 2:
+			return false, []string{st.Leader}, nil
+		}
+		return false, nil, b.noGlobalLeader(key)
+	}
+	if hops >= 2 {
+		return false, nil, b.noGlobalLeader(key)
+	}
+	// Not a replica: our region's replica first (cheap hop), then reachable replicas elsewhere.
+	for _, r := range pm.Replicas {
+		if b.cfg.Directory[r].Region == b.cfg.Info.Region {
+			cands = append(cands, r)
+		}
+	}
+	for _, r := range pm.Replicas {
+		if b.cfg.Directory[r].Region != b.cfg.Info.Region && b.geo.Reachable(r) {
+			cands = append(cands, r)
+		}
+	}
+	if len(cands) == 0 {
+		return false, nil, b.noGlobalLeader(key)
+	}
+	return false, cands, nil
+}
+
+func (b *Broker) noGlobalLeader(key meta.PartKey) error {
+	reachable := 1
+	for _, r := range b.regionNames() {
+		if r != b.cfg.Info.Region && b.geo.RegionReachable(r) {
+			reachable++
+		}
+	}
+	if reachable < len(b.regionNames())/2+1 {
+		e := api.Errorf(api.CodeNotEnoughReplicas, "global partition %s needs a majority of regions; region %s can reach only %d of %d",
+			key, b.cfg.Info.Region, reachable, len(b.regionNames()))
+		e.Reason = "region_isolated"
+		return e
+	}
+	e := api.Errorf(api.CodeNotEnoughReplicas, "global partition %s has no leader yet (election in progress)", key)
+	e.Reason = "electing_leader"
+	return e
+}
+
+// forward sends an internal request to the first candidate that answers. Broker errors are
+// returned as-is; transport failures move on to the next candidate.
+func (b *Broker) forward(ctx context.Context, t *meta.TopicMeta, cands []string, path string, timeout time.Duration, in, out any) error {
+	var lastErr error
+	for _, to := range cands {
+		if err := b.guard.CheckPeer(t.Config.Name, t.Config.Residency, to, "forward to"); err != nil {
+			return err
+		}
+		cctx, cancel := context.WithTimeout(ctx, timeout)
+		err := b.geo.Send(cctx, to, path, t.Config.Name, t.Config.Residency, in, out)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		var ae *api.Error
+		if errors.As(err, &ae) {
+			return ae
+		}
+		lastErr = asUnavailable(err, to)
+	}
+	return lastErr
 }
 
 func (b *Broker) sticky(topic string, n int) int {
@@ -458,7 +736,7 @@ func (b *Broker) Produce(ctx context.Context, req api.ProduceRequest) (api.Produ
 			for j, i := range idx {
 				recs[j] = req.Records[i]
 			}
-			base, err := b.producePartition(ctx, req.Topic, p, t.Partitions[p].Leader, recs)
+			base, err := b.producePartition(ctx, t, p, recs, 0)
 			if err != nil {
 				errs[gi] = err
 				return
@@ -482,38 +760,25 @@ type partitionProduce struct {
 	Topic     string              `json:"topic"`
 	Partition int                 `json:"partition"`
 	Records   []api.ProduceRecord `json:"records"`
+	Hops      int                 `json:"hops"`
 }
 
 type partitionProduceResp struct {
 	Base uint64 `json:"base"`
 }
 
-// checkForward refuses to relay a resident topic's data through a broker outside its region.
-func (b *Broker) checkForward(topic, to string) error {
-	t, ok := b.coord.Committed().Topics[topic]
-	if !ok {
-		return api.Errorf(api.CodeUnknownTopic, "unknown topic %q", topic)
-	}
-	return b.guard.CheckPeer(topic, t.Config.Residency, to, "forward to")
-}
-
-func (b *Broker) producePartition(ctx context.Context, topic string, part int, leader string, recs []api.ProduceRecord) (uint64, error) {
-	switch leader {
-	case b.cfg.Info.ID:
-		return b.produceLocal(ctx, topic, part, recs)
-	case "":
-		e := api.Errorf(api.CodeNotEnoughReplicas, "%s/%d has no leader", topic, part)
-		e.Reason = "partition_offline"
-		return 0, e
-	}
-	if err := b.checkForward(topic, leader); err != nil {
+func (b *Broker) producePartition(ctx context.Context, t *meta.TopicMeta, part int, recs []api.ProduceRecord, hops int) (uint64, error) {
+	local, cands, err := b.targets(t, part, hops)
+	if err != nil {
 		return 0, err
 	}
-	cctx, cancel := context.WithTimeout(ctx, b.cfg.Replica.ProduceTimeout+b.cfg.Replica.RPCTimeout)
-	defer cancel()
+	if local {
+		return b.produceLocal(ctx, t.Config.Name, part, recs)
+	}
 	var out partitionProduceResp
-	if err := b.rpc.Call(cctx, leader, pathProduce, partitionProduce{topic, part, recs}, &out); err != nil {
-		return 0, asUnavailable(err, leader)
+	in := partitionProduce{t.Config.Name, part, recs, hops + 1}
+	if err := b.forward(ctx, t, cands, pathProduce, b.cfg.Replica.ProduceTimeout+2*b.cfg.Replica.RPCTimeout, in, &out); err != nil {
+		return 0, err
 	}
 	return out.Base, nil
 }
@@ -534,7 +799,14 @@ func (b *Broker) produceLocal(ctx context.Context, topic string, part int, recs 
 }
 
 func (b *Broker) handleProduce(ctx context.Context, req *partitionProduce) (*partitionProduceResp, error) {
-	base, err := b.produceLocal(ctx, req.Topic, req.Partition, req.Records)
+	t, err := b.topicMeta(req.Topic)
+	if err != nil {
+		return nil, err
+	}
+	if req.Partition < 0 || req.Partition >= len(t.Partitions) {
+		return nil, api.Errorf(api.CodeUnknownPartition, "topic %q has no partition %d", req.Topic, req.Partition)
+	}
+	base, err := b.producePartition(ctx, t, req.Partition, req.Records, req.Hops)
 	if err != nil {
 		return nil, err
 	}
@@ -548,6 +820,7 @@ type partitionFetch struct {
 	MaxRecords int    `json:"max_records"`
 	MaxBytes   int    `json:"max_bytes"`
 	WaitMs     int64  `json:"wait_ms"`
+	Hops       int    `json:"hops"`
 }
 
 func (b *Broker) Fetch(ctx context.Context, req api.FetchRequest) (api.FetchResponse, error) {
@@ -563,24 +836,21 @@ func (b *Broker) Fetch(ctx context.Context, req api.FetchRequest) (api.FetchResp
 	}
 	req.MaxRecords = min(req.MaxRecords, api.MaxFetchRecords)
 	req.Wait = min(req.Wait, api.MaxFetchWait)
-	leader := t.Partitions[req.Partition].Leader
-	switch leader {
-	case b.cfg.Info.ID:
-		return b.fetchLocal(ctx, req)
-	case "":
-		e := api.Errorf(api.CodeNotEnoughReplicas, "%s/%d has no leader", req.Topic, req.Partition)
-		e.Reason = "partition_offline"
-		return api.FetchResponse{}, e
-	}
-	if err := b.checkForward(req.Topic, leader); err != nil {
+	return b.fetchPartition(ctx, t, req, 0)
+}
+
+func (b *Broker) fetchPartition(ctx context.Context, t *meta.TopicMeta, req api.FetchRequest, hops int) (api.FetchResponse, error) {
+	local, cands, err := b.targets(t, req.Partition, hops)
+	if err != nil {
 		return api.FetchResponse{}, err
 	}
-	cctx, cancel := context.WithTimeout(ctx, req.Wait+b.cfg.Replica.RPCTimeout)
-	defer cancel()
+	if local {
+		return b.fetchLocal(ctx, req)
+	}
 	var out api.FetchResponse
-	in := partitionFetch{req.Topic, req.Partition, req.Offset, req.MaxRecords, req.MaxBytes, req.Wait.Milliseconds()}
-	if err := b.rpc.Call(cctx, leader, pathFetch, in, &out); err != nil {
-		return api.FetchResponse{}, asUnavailable(err, leader)
+	in := partitionFetch{req.Topic, req.Partition, req.Offset, req.MaxRecords, req.MaxBytes, req.Wait.Milliseconds(), hops + 1}
+	if err := b.forward(ctx, t, cands, pathFetch, req.Wait+2*b.cfg.Replica.RPCTimeout, in, &out); err != nil {
+		return api.FetchResponse{}, err
 	}
 	return out, nil
 }
@@ -594,10 +864,17 @@ func (b *Broker) fetchLocal(ctx context.Context, req api.FetchRequest) (api.Fetc
 }
 
 func (b *Broker) handleFetch(ctx context.Context, req *partitionFetch) (*api.FetchResponse, error) {
-	resp, err := b.fetchLocal(ctx, api.FetchRequest{
+	t, err := b.topicMeta(req.Topic)
+	if err != nil {
+		return nil, err
+	}
+	if req.Partition < 0 || req.Partition >= len(t.Partitions) {
+		return nil, api.Errorf(api.CodeUnknownPartition, "topic %q has no partition %d", req.Topic, req.Partition)
+	}
+	resp, err := b.fetchPartition(ctx, t, api.FetchRequest{
 		Topic: req.Topic, Partition: req.Partition, Offset: req.Offset,
 		MaxRecords: req.MaxRecords, MaxBytes: req.MaxBytes, Wait: time.Duration(req.WaitMs) * time.Millisecond,
-	})
+	}, req.Hops)
 	if err != nil {
 		return nil, err
 	}
@@ -617,13 +894,21 @@ func asUnavailable(err error, peer string) error {
 }
 
 func (b *Broker) registerAdmin(mux *http.ServeMux) {
+	// Simulated network: blocked peer links and extra one-way delay (ms) per peer.
 	type netState struct {
-		Blocked []string `json:"blocked"`
+		Blocked  []string         `json:"blocked"`
+		DelaysMs map[string]int64 `json:"delays_ms,omitempty"`
+	}
+	current := func() netState {
+		s := netState{Blocked: b.net.List(), DelaysMs: map[string]int64{}}
+		slices.Sort(s.Blocked)
+		for id, d := range b.net.Delays() {
+			s.DelaysMs[id] = d.Milliseconds()
+		}
+		return s
 	}
 	mux.HandleFunc("GET /admin/v1/net", func(w http.ResponseWriter, r *http.Request) {
-		blocked := b.net.List()
-		slices.Sort(blocked)
-		httpapi.WriteJSON(w, http.StatusOK, netState{Blocked: blocked})
+		httpapi.WriteJSON(w, http.StatusOK, current())
 	})
 	mux.HandleFunc("POST /admin/v1/net", func(w http.ResponseWriter, r *http.Request) {
 		var s netState
@@ -631,17 +916,56 @@ func (b *Broker) registerAdmin(mux *http.ServeMux) {
 			return
 		}
 		b.net.Set(s.Blocked)
-		slog.Warn("network links changed", "blocked", s.Blocked)
-		httpapi.WriteJSON(w, http.StatusOK, s)
+		delays := map[string]time.Duration{}
+		for id, ms := range s.DelaysMs {
+			delays[id] = time.Duration(ms) * time.Millisecond
+		}
+		b.net.SetDelays(delays)
+		slog.Warn("network links changed", "blocked", s.Blocked, "delays_ms", s.DelaysMs)
+		httpapi.WriteJSON(w, http.StatusOK, current())
 	})
 	mux.HandleFunc("GET /admin/v1/status", func(w http.ResponseWriter, r *http.Request) {
 		ctrl, epoch := b.coord.Controller()
+		regions := map[string]bool{}
+		for _, r := range b.regionNames() {
+			regions[r] = b.geo.RegionReachable(r)
+		}
 		httpapi.WriteJSON(w, http.StatusOK, map[string]any{
 			"broker": b.cfg.Info, "controller": ctrl, "controller_epoch": epoch,
 			"is_controller": b.coord.IsController(), "synced": b.coord.Synced(),
 			"metadata_version":     b.coord.Committed().Version,
 			"residency_rejections": b.guard.Rejected(),
+			"regions_reachable":    regions,
+			"relayed_requests":     b.geo.Relayed(),
 		})
+	})
+	// Inter-region links as this broker measures them, and the path global traffic takes.
+	mux.HandleFunc("GET /admin/v1/routes", func(w http.ResponseWriter, r *http.Request) {
+		httpapi.WriteJSON(w, http.StatusOK, map[string]any{"from": b.cfg.Info.ID, "links": b.geo.Links()})
+	})
+	// Per-partition replica state on this broker (role, epoch, offsets).
+	mux.HandleFunc("GET /admin/v1/partitions", func(w http.ResponseWriter, r *http.Request) {
+		type ps struct {
+			Topic     string `json:"topic"`
+			Partition int    `json:"partition"`
+			Role      string `json:"role"`
+			Leader    string `json:"leader"`
+			Epoch     uint64 `json:"epoch"`
+			HW        uint64 `json:"hw"`
+			End       uint64 `json:"end_offset"`
+		}
+		var out []ps
+		for _, p := range b.parts.All() {
+			st := p.Status()
+			out = append(out, ps{p.Key.Topic, p.Key.Partition, st.Role.String(), st.Leader, st.Epoch, st.HW, st.EndOffset})
+		}
+		sort.Slice(out, func(i, j int) bool {
+			if out[i].Topic != out[j].Topic {
+				return out[i].Topic < out[j].Topic
+			}
+			return out[i].Partition < out[j].Partition
+		})
+		httpapi.WriteJSON(w, http.StatusOK, out)
 	})
 	// The signed manifest of every segment this broker stores (see internal/manifest).
 	mux.HandleFunc("GET /admin/v1/manifest", func(w http.ResponseWriter, r *http.Request) {

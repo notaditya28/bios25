@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/notaditya28/hydra-stream/internal/api"
 	"github.com/notaditya28/hydra-stream/internal/meta"
 	"github.com/notaditya28/hydra-stream/internal/replica"
 )
@@ -14,15 +15,39 @@ import (
 func (b *Broker) runController(ctx context.Context) {
 	t := time.NewTicker(50 * time.Millisecond)
 	defer t.Stop()
+	var lastSync time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
-		if b.coord.IsController() {
-			b.electLeaders(ctx)
+		if !b.coord.IsController() {
+			continue
 		}
+		b.electLeaders(ctx)
+		if time.Since(lastSync) > time.Second {
+			b.syncGlobalTopics(ctx)
+			lastSync = time.Now()
+		}
+	}
+}
+
+// syncGlobalTopics creates global topics other regions have that this region is missing
+// (e.g. created while this region was down or isolated). Only topic configs travel; data
+// arrives through normal replication once the partition replica exists.
+func (b *Broker) syncGlobalTopics(ctx context.Context) {
+	md := b.coord.Committed()
+	for _, ts := range b.geo.GlobalTopics() {
+		if _, ok := md.Topics[ts.Name]; ok {
+			continue
+		}
+		cfg := api.TopicConfig{Name: ts.Name, Partitions: ts.Partitions, Residency: api.ResidencyGlobal}
+		if _, err := b.createAsController(ctx, cfg); err != nil {
+			slog.Warn("sync global topic failed", "topic", ts.Name, "err", err)
+			continue
+		}
+		slog.Info("global topic synced from another region", "topic", ts.Name)
 	}
 }
 
@@ -49,6 +74,9 @@ func (b *Broker) electLeaders(ctx context.Context) {
 	var decisions []decision
 	var wg sync.WaitGroup
 	for name, t := range md.Topics {
+		if t.Config.Residency == api.ResidencyGlobal {
+			continue // global partitions elect their own leaders across regions
+		}
 		for i, pm := range t.Partitions {
 			key := meta.PartKey{Topic: name, Partition: i}
 			if pm.Leader != "" && live[pm.Leader] && !stuck[key] {

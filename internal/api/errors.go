@@ -19,6 +19,7 @@ const (
 	CodeNotEnoughReplicas  Code = "NOT_ENOUGH_REPLICAS" // quorum unreachable; write not acknowledged
 	CodeRegionUnavailable  Code = "REGION_UNAVAILABLE"  // the region owning this data is down or isolated
 	CodeResidencyViolation Code = "RESIDENCY_VIOLATION"
+	CodeWrongRegion        Code = "WRONG_REGION" // topic is resident in another region; Leader lists its brokers
 	CodeInternal           Code = "INTERNAL"
 )
 
@@ -62,7 +63,7 @@ func (c Code) HTTPStatus() int {
 		return http.StatusConflict
 	case CodeOffsetOutOfRange:
 		return http.StatusRequestedRangeNotSatisfiable
-	case CodeNotLeader:
+	case CodeNotLeader, CodeWrongRegion:
 		return http.StatusMisdirectedRequest
 	case CodeStaleEpoch:
 		return http.StatusConflict

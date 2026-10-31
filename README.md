@@ -8,7 +8,7 @@ routes around slow links, and a regional outage never freezes the surviving regi
 - [x] Milestone 1 — single broker: segmented on-disk log, topics/partitions/offsets, HTTP/JSON produce & consume
 - [x] Milestone 2 — in-region replication (3 zones, 2-of-3 acks, lease-elected controller, epoch-fenced leader failover)
 - [x] Milestone 3 — residency enforcement at every data path + signed manifests + `residency_audit`
-- [ ] Milestone 4 — multi-region, global replication, latency-aware routing
+- [x] Milestone 4 — independent regions; global topics with cross-region quorum and self-elected leaders; latency-aware relay routing
 - [ ] Milestone 5 — chaos harness + correctness checker
 - [ ] Milestone 6 — dashboard
 
@@ -48,6 +48,17 @@ Copy-Item -Recurse data\in-1\topics\aadhaar data\eu-2\topics\aadhaar # simulate 
 Remove-Item -Recurse data\eu-2\topics\aadhaar
 ```
 
+Multi-region (all 9 brokers running):
+```powershell
+.\bin\hydra.exe create-topic -b 127.0.0.1:9101 -name prices -partitions 3 -residency global   # one replica per region
+.\bin\hydra.exe produce -b 127.0.0.1:9201 -topic prices -n 100000 -keys                        # from EU
+.\bin\hydra.exe consume -b 127.0.0.1:9301 -topic prices -partition 0 -quiet                    # from US
+Invoke-RestMethod http://127.0.0.1:9201/admin/v1/routes | ForEach-Object links | Format-Table # measured RTTs + relay choice
+# slow IN<->EU by 150 ms each way (POST the same to eu-1..3 with the in-* ids):
+Invoke-RestMethod -Method Post http://127.0.0.1:9101/admin/v1/net -ContentType application/json -Body '{"blocked":[],"delays_ms":{"eu-1":150,"eu-2":150,"eu-3":150}}'
+.\scripts\hydra.ps1 kill -Region IN                                                            # whole region down
+```
+
 Raw HTTP works too:
 ```powershell
 curl.exe -s -X POST localhost:9101/v1/topics/orders/records -d '{\"records\":[{\"key\":\"u1\",\"value\":\"hello\"}]}'
@@ -65,6 +76,7 @@ internal/coord          Coordinator interface + lease-based controller election 
 internal/replica        partition replicas: 2-of-3 acks, epoch fencing, follower truncation
 internal/meta           region metadata (topics, replicas, leaders, epochs)
 internal/rpc            broker-to-broker JSON/HTTP + link blocker for partition simulation
+internal/geo            inter-region latency probes, relay path selection, topic gossip
 internal/residency      residency guard used at every store / replicate / relay / place decision
 internal/layout         on-disk layout of a broker data directory + scanner
 internal/manifest       signed (Ed25519) per-broker segment manifests

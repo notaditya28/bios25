@@ -36,7 +36,8 @@ type Timing struct {
 	FollowerTimeout time.Duration // a follower silent this long doesn't count towards the quorum
 	ProduceTimeout  time.Duration // max wait for a write to reach a majority
 	RPCTimeout      time.Duration
-	MaxBatch        int // records per replication request
+	MaxBatch        int           // records per replication request
+	ElectionTimeout time.Duration // self-elected (global) partitions: campaign after this much silence (+ up to 50% jitter)
 }
 
 func DefaultTiming() Timing {
@@ -46,11 +47,25 @@ func DefaultTiming() Timing {
 		ProduceTimeout:  2000 * time.Millisecond,
 		RPCTimeout:      1000 * time.Millisecond,
 		MaxBatch:        5000,
+		ElectionTimeout: 600 * time.Millisecond,
 	}
 }
 
+// Sender delivers internal requests about a partition to another broker. The geo router
+// implements it to route global partitions' cross-region traffic over the fastest path.
+type Sender interface {
+	Send(ctx context.Context, to, path, topic, residency string, in, out any) error
+}
+
+type directSender struct{ c *rpc.Client }
+
+func (d directSender) Send(ctx context.Context, to, path, _, _ string, in, out any) error {
+	return d.c.Call(ctx, to, path, in, out)
+}
+
 type partState struct {
-	Epoch uint64 `json:"epoch"`
+	Epoch    uint64 `json:"epoch"`
+	VotedFor string `json:"voted_for,omitempty"` // self-elected partitions: our vote in Epoch
 }
 
 type follower struct {
@@ -66,11 +81,12 @@ type Partition struct {
 	self      string
 	log       *seglog.Log
 	state     string
-	rpc       *rpc.Client
+	send      Sender
 	timing    Timing
 
 	mu          sync.Mutex
 	epoch       uint64 // highest leader epoch accepted (persisted): fences anything older
+	votedFor    string
 	role        Role
 	leader      string
 	leaderEpoch uint64
@@ -81,23 +97,30 @@ type Partition struct {
 	changed     chan struct{} // closed and replaced when hw or role changes
 	followers   map[string]*follower
 	stopRepl    context.CancelFunc
+
+	// Self-elected partitions (global topics) elect their own leader instead of being
+	// assigned one by a region controller. See election.go.
+	selfElected bool
+	lastHeard   time.Time // last valid message from a leader (or our own vote/campaign)
+	leaderSince time.Time
+	stopElect   context.CancelFunc
 }
 
-func openPartition(dir string, key meta.PartKey, res, self string, logCfg seglog.Config, client *rpc.Client, timing Timing, guard *residency.Guard) (*Partition, error) {
+func openPartition(dir string, key meta.PartKey, res, self string, logCfg seglog.Config, send Sender, timing Timing, guard *residency.Guard) (*Partition, error) {
 	l, err := seglog.Open(dir, logCfg)
 	if err != nil {
 		return nil, err
 	}
 	p := &Partition{
 		Key: key, residency: res, guard: guard, self: self, log: l, state: filepath.Join(dir, "state.json"),
-		rpc: client, timing: timing, changed: make(chan struct{}),
+		send: send, timing: timing, changed: make(chan struct{}),
 	}
 	var st partState
 	if err := fsutil.ReadJSON(p.state, &st); err != nil && !errors.Is(err, os.ErrNotExist) {
 		l.Close()
 		return nil, err
 	}
-	p.epoch = st.Epoch
+	p.epoch, p.votedFor = st.Epoch, st.VotedFor
 	return p, nil
 }
 
@@ -108,12 +131,17 @@ func (p *Partition) notifyLocked() {
 	p.changed = make(chan struct{})
 }
 
+// setEpochLocked moves to a newer epoch (forgetting any vote cast in the old one) and persists it.
 func (p *Partition) setEpochLocked(e uint64) {
 	if e == p.epoch {
 		return
 	}
-	p.epoch = e
-	if err := fsutil.WriteJSONAtomic(p.state, partState{Epoch: e}); err != nil {
+	p.epoch, p.votedFor = e, ""
+	p.persistLocked()
+}
+
+func (p *Partition) persistLocked() {
+	if err := fsutil.WriteJSONAtomic(p.state, partState{Epoch: p.epoch, VotedFor: p.votedFor}); err != nil {
 		slog.Error("persist partition epoch", "partition", p.Key, "err", err)
 	}
 }
@@ -163,6 +191,7 @@ func (p *Partition) becomeLeader(epoch uint64, replicas []string) {
 		return
 	}
 	p.epochStart = base
+	p.leaderSince = time.Now()
 	ctx, cancel := context.WithCancel(context.Background())
 	p.stopRepl = cancel
 	p.followers = map[string]*follower{}
@@ -414,6 +443,7 @@ func (p *Partition) handleAppend(req *AppendRequest) (*AppendResponse, error) {
 		p.role, p.leader, p.leaderEpoch = RoleFollower, req.Leader, req.LeaderEpoch
 		p.notifyLocked()
 	}
+	p.lastHeard = time.Now() // a valid leader is alive: hold off elections
 
 	leo := p.log.EndOffset()
 	if req.PrevOffset > leo {
@@ -518,7 +548,7 @@ func (p *Partition) replicate(ctx context.Context, to string, epoch uint64) {
 		lastSent = time.Now()
 		rctx, cancel := context.WithTimeout(ctx, p.timing.RPCTimeout)
 		var resp AppendResponse
-		err := p.rpc.Call(rctx, to, PathAppend, req, &resp)
+		err := p.send.Send(rctx, to, PathAppend, p.Key.Topic, p.residency, req, &resp)
 		cancel()
 		if err != nil {
 			if ctx.Err() == nil {
@@ -569,6 +599,9 @@ func (p *Partition) advanceHWLocked() {
 
 func (p *Partition) close() error {
 	p.mu.Lock()
+	if p.stopElect != nil {
+		p.stopElect()
+	}
 	p.stopReplicationLocked()
 	p.role = RoleNone
 	p.notifyLocked()
