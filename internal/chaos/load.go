@@ -23,12 +23,24 @@ type Stream struct {
 	Residency string // topic residency
 	Home      string // region whose brokers the client prefers
 	Addrs     []string
+	Light     bool // keep counters only, not every ack (long-running dashboard load)
 
-	mu    sync.Mutex
-	acks  []Ack
-	fails []Fail
-	start time.Time
-	stop  time.Time
+	mu      sync.Mutex
+	acks    []Ack
+	fails   []Fail
+	start   time.Time
+	stop    time.Time
+	nAcked  int64
+	nFailed int64
+	lastAck time.Time
+	lastErr string
+}
+
+// Counters returns totals since the stream started, the last ack time and the last error code.
+func (s *Stream) Counters() (acked, failed int64, lastAck time.Time, lastErr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.nAcked, s.nFailed, s.lastAck, s.lastErr
 }
 
 type Ack struct {
@@ -74,7 +86,11 @@ func (s *Stream) Run(ctx context.Context, batch int, interval time.Duration) {
 			}
 			code, reason := errCode(a.Err)
 			s.mu.Lock()
-			s.fails = append(s.fails, Fail{At: time.Now(), Took: a.Took, Code: code, Reason: reason})
+			s.nFailed++
+			s.lastErr = code + reasonSuffix(reason)
+			if !s.Light {
+				s.fails = append(s.fails, Fail{At: time.Now(), Took: a.Took, Code: code, Reason: reason})
+			}
 			s.mu.Unlock()
 		})
 		if err != nil {
@@ -82,8 +98,13 @@ func (s *Stream) Run(ctx context.Context, batch int, interval time.Duration) {
 		}
 		now := time.Now()
 		s.mu.Lock()
-		for i, o := range resp.Offsets {
-			s.acks = append(s.acks, Ack{Offset: o.Offset, Value: vals[i], At: now, Latency: now.Sub(start)})
+		s.nAcked += int64(len(resp.Offsets))
+		s.lastAck = now
+		s.lastErr = ""
+		if !s.Light {
+			for i, o := range resp.Offsets {
+				s.acks = append(s.acks, Ack{Offset: o.Offset, Value: vals[i], At: now, Latency: now.Sub(start)})
+			}
 		}
 		s.mu.Unlock()
 		n += batch
@@ -112,10 +133,7 @@ func (s *Stream) Fails() []Fail {
 func (s *Stream) LastAck() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.acks) == 0 {
-		return time.Time{}
-	}
-	return s.acks[len(s.acks)-1].At
+	return s.lastAck
 }
 
 // MaxStall is the longest time the stream went without an acknowledgement, from its start to

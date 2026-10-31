@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hydra Stream</title>
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #111110;
+  --surface-1: #1a1a19;
+  --surface-2: #232321;
+  --border: #33332f;
+  --text-primary: #f0efec;
+  --text-secondary: #c3c2b7;
+  --text-muted: #8d8c84;
+  --series-IN: #3987e5;
+  --series-EU: #d95926;
+  --series-US: #199e70;
+  --good: #0ca30c;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+  --accent: #9085e9;
+  --btn: #2b2b29;
+  --btn-hover: #383835;
+}
+@media (prefers-color-scheme: light) {
+  :root:where(:not([data-theme="dark"])) {
+    color-scheme: light;
+    --bg: #f4f3f0;
+    --surface-1: #fcfcfb;
+    --surface-2: #f0efec;
+    --border: #dddcd6;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #77766f;
+    --series-IN: #2a78d6;
+    --series-EU: #eb6834;
+    --series-US: #1baf7a;
+    --accent: #6250d6;
+    --btn: #ebeae5;
+    --btn-hover: #dddcd6;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text-primary);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+header {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 12px 24px;
+  padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--surface-1);
+}
+header h1 { font-size: 18px; margin: 0; letter-spacing: .2px; }
+header .sub { color: var(--text-muted); font-size: 12px; }
+.hero { display: flex; align-items: baseline; gap: 6px; }
+.hero .num { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.hero .unit { color: var(--text-secondary); }
+.spacer { flex: 1; }
+main {
+  display: grid; gap: 16px; padding: 16px 20px 32px;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+}
+.panel {
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px 16px; min-width: 0;
+}
+.panel h2 {
+  margin: 0 0 10px; font-size: 13px; font-weight: 600; color: var(--text-secondary);
+  text-transform: uppercase; letter-spacing: .6px;
+}
+.span-5 { grid-column: span 5; } .span-7 { grid-column: span 7; }
+.span-4 { grid-column: span 4; } .span-8 { grid-column: span 8; } .span-12 { grid-column: span 12; }
+@media (max-width: 1000px) { .span-4, .span-5, .span-7, .span-8 { grid-column: span 12; } }
+@media (max-width: 600px) { main { padding: 12px 16px; } }
+button {
+  font: inherit; font-size: 13px; color: var(--text-primary); background: var(--btn);
+  border: 1px solid var(--border); border-radius: 7px; padding: 5px 10px; cursor: pointer;
+}
+button:hover { background: var(--btn-hover); }
+button.danger { border-color: color-mix(in srgb, var(--critical) 55%, var(--border)); }
+button.warn { border-color: color-mix(in srgb, var(--warning) 55%, var(--border)); }
+button.small { padding: 2px 8px; font-size: 12px; }
+select, input {
+  font: inherit; font-size: 13px; color: var(--text-primary); background: var(--surface-2);
+  border: 1px solid var(--border); border-radius: 7px; padding: 4px 8px;
+}
+input[type=number] { width: 80px; }
+.badge {
+  display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600;
+  padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-2);
+  color: var(--text-primary); white-space: nowrap;
+}
+.badge .ico { font-size: 11px; }
+.s-good .ico { color: var(--good); } .s-warning .ico { color: var(--warning); }
+.s-serious .ico { color: var(--serious); } .s-critical .ico { color: var(--critical); }
+.muted { color: var(--text-muted); }
+.secondary { color: var(--text-secondary); }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; vertical-align: -1px; }
+.row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+/* map */
+#map svg { width: 100%; height: auto; display: block; }
+#map .edge { stroke: var(--text-muted); stroke-width: 2; }
+#map .edge.slow { stroke: var(--warning); stroke-width: 2.5; }
+#map .edge.blocked { stroke: var(--critical); stroke-dasharray: 6 6; }
+#map .relay { stroke: var(--accent); stroke-width: 2.5; stroke-dasharray: 2 5; fill: none; stroke-linecap: round; }
+#map .node circle { fill: var(--surface-2); stroke-width: 3; }
+#map text { fill: var(--text-primary); font-size: 13px; }
+#map .lbl { fill: var(--text-secondary); font-size: 12px; }
+#map .lbl-bg { fill: var(--surface-1); }
+
+/* regions */
+.regions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; grid-column: span 12; }
+@media (max-width: 1000px) { .regions { grid-template-columns: 1fr; } }
+.region-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.region-head h3 { margin: 0; font-size: 16px; }
+.brokers { list-style: none; margin: 10px 0; padding: 0; }
+.brokers li {
+  display: grid; grid-template-columns: 18px 56px 1fr auto; align-items: center; gap: 6px;
+  padding: 6px 0; border-top: 1px solid var(--border);
+}
+.brokers li:first-child { border-top: 0; }
+.dot { font-size: 12px; }
+.dot.up { color: var(--good); } .dot.down { color: var(--critical); }
+.tag { font-size: 11px; color: var(--text-secondary); border: 1px solid var(--border); border-radius: 5px; padding: 0 5px; margin-left: 4px; }
+
+/* throughput */
+.stream { display: grid; grid-template-columns: 190px 1fr 92px; gap: 10px; align-items: center; padding: 5px 0; }
+@media (max-width: 600px) { .stream { grid-template-columns: 1fr 80px; } .stream .spark { grid-column: span 2; order: 3; } }
+.stream .name { font-size: 13px; }
+.stream .name small { display: block; color: var(--text-muted); font-size: 11px; }
+.stream .rate { text-align: right; font-variant-numeric: tabular-nums; }
+.stream .rate b { font-size: 15px; }
+.stream .rate small { display: block; font-size: 11px; color: var(--text-muted); }
+.spark { position: relative; height: 38px; }
+.spark svg { width: 100%; height: 38px; display: block; overflow: visible; }
+.spark .line { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.spark .area { opacity: .14; }
+.spark .base { stroke: var(--border); stroke-width: 1; }
+.tip {
+  position: fixed; pointer-events: none; z-index: 10; display: none;
+  background: var(--surface-2); color: var(--text-primary); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; font-size: 12px; font-variant-numeric: tabular-nums;
+}
+.group-title { font-size: 12px; color: var(--text-muted); margin: 8px 0 2px; }
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 5px 4px; border-bottom: 1px solid var(--border); }
+th { color: var(--text-muted); font-weight: 500; }
+td.num { font-variant-numeric: tabular-nums; }
+
+.events { list-style: none; margin: 0; padding: 0; max-height: 300px; overflow: auto; font-size: 13px; }
+.events li { display: grid; grid-template-columns: 64px 62px 1fr; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--border); }
+.events time { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.findings { margin: 8px 0 0; padding-left: 16px; font-size: 12px; color: var(--text-secondary); max-height: 120px; overflow: auto; }
+.err { color: var(--critical); font-size: 12px; min-height: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Hydra Stream</h1>
+    <div class="sub">region-aware message broker · data stays in its legal region · SDG 9.1</div>
+  </div>
+  <div class="hero" title="acknowledged messages per second, all load streams">
+    <span class="num" id="total">–</span><span class="unit">msg/s acknowledged</span>
+  </div>
+  <span id="auditPill" class="badge">audit …</span>
+  <div class="spacer"></div>
+  <span class="err" id="err" role="status"></span>
+  <button data-action="heal-all" title="start every broker and restore every link">Heal everything</button>
+</header>
+
+<main>
+  <section class="panel span-5" id="map">
+    <h2>Regions &amp; links</h2>
+    <div id="mapSvg"></div>
+    <div class="muted" style="font-size:12px">Edge labels: best measured round trip between the regions' brokers.
+      Dotted purple path = global traffic rerouted through a third region.</div>
+  </section>
+
+  <section class="panel span-7">
+    <h2>Live throughput (acknowledged msg/s, last 60 s)</h2>
+    <div class="group-title">Resident topics — each region writes only to its own brokers</div>
+    <div id="resident"></div>
+    <div class="group-title">Global topic <code>prices</code> — one replica per region, commits at 2 of 3</div>
+    <div id="globalStreams"></div>
+  </section>
+
+  <div class="regions" id="regions"></div>
+
+  <section class="panel span-4">
+    <h2>Global partition leaders</h2>
+    <table><thead><tr><th>Partition</th><th>Leader</th><th>Region</th><th>Epoch</th></tr></thead>
+      <tbody id="global"></tbody></table>
+    <h2 style="margin-top:16px">Slow a link</h2>
+    <div class="row">
+      <select id="slowA" aria-label="first region"></select>
+      <span class="muted">↔</span>
+      <select id="slowB" aria-label="second region"></select>
+      <input id="slowMs" type="number" min="0" step="10" value="150" aria-label="one-way delay in ms"> <span class="muted">ms</span>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button class="warn" id="slowApply">Slow link</button>
+      <button id="slowClear">Restore link</button>
+    </div>
+  </section>
+
+  <section class="panel span-4">
+    <h2>Residency audit</h2>
+    <div class="row"><span id="auditBig" class="badge">…</span><span class="muted" id="auditWhen"></span></div>
+    <div class="secondary" id="auditCounts" style="margin-top:6px"></div>
+    <ul class="findings" id="findings"></ul>
+    <div style="margin-top:10px"><button data-action="audit">Run audit now</button></div>
+    <p class="muted" style="font-size:12px;margin-bottom:0">Scans every broker's data directory and verifies each live broker's signed
+      segment manifest. Runs every 5 s, also while faults are active.</p>
+  </section>
+
+  <section class="panel span-4">
+    <h2>Events</h2>
+    <ul class="events" id="events"></ul>
+  </section>
+</main>
+<div class="tip" id="tip"></div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const fmt = (n) => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : Math.round(n).toString();
+const STATUS = {
+  up: { cls: "s-good", ico: "●", label: "up" },
+  degraded: { cls: "s-warning", ico: "▲", label: "degraded" },
+  isolated: { cls: "s-serious", ico: "◆", label: "isolated" },
+  down: { cls: "s-critical", ico: "✕", label: "down" },
+};
+const badge = (st) => `<span class="badge ${st.cls}"><span class="ico" aria-hidden="true">${st.ico}</span>${esc(st.label)}</span>`;
+let state = null;
+
+async function post(body) {
+  $("err").textContent = "";
+  try {
+    const r = await fetch("/api/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) $("err").textContent = await r.text();
+  } catch (e) { $("err").textContent = "dashboard unreachable"; }
+  refresh();
+}
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-action]");
+  if (!b) return;
+  const body = { action: b.dataset.action };
+  if (b.dataset.region) body.region = b.dataset.region;
+  if (b.dataset.id) body.id = b.dataset.id;
+  post(body);
+});
+$("slowApply").onclick = () => post({ action: "slow-link", a: $("slowA").value, b: $("slowB").value, ms: +$("slowMs").value });
+$("slowClear").onclick = () => post({ action: "slow-link", a: $("slowA").value, b: $("slowB").value, ms: 0 });
+
+// ---- map ----
+const POS = [[210, 92], [72, 268], [348, 268]];
+function renderMap(s) {
+  const names = s.regions.map((r) => r.name);
+  const pos = {}; names.forEach((n, i) => pos[n] = POS[i % 3]);
+  let edges = "", labels = "", relays = "";
+  const relayNotes = {};
+  for (const l of s.links) {
+    const [x1, y1] = pos[l.a], [x2, y2] = pos[l.b];
+    const cls = l.blocked ? "edge blocked" : l.slowed_ms > 0 ? "edge slow" : "edge";
+    edges += `<line class="${cls}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}"/>`;
+    let text = l.blocked ? "✕ cut off" : l.rtt_ms < 0 ? "unreachable" : `${l.rtt_ms.toFixed(1)} ms`;
+    if (l.slowed_ms > 0 && !l.blocked) text = `▲ +${l.slowed_ms} ms · ${l.rtt_ms < 0 ? "?" : l.rtt_ms.toFixed(0) + " ms"}`;
+    const mx = (x1 + x2) / 2, my = (y1 + y2) / 2 + (y1 === y2 ? 18 : 0);
+    const w = text.length * 6.8 + 12;
+    labels += `<rect class="lbl-bg" x="${mx - w / 2}" y="${my - 11}" width="${w}" height="20" rx="4"/>` +
+      `<text class="lbl" x="${mx}" y="${my + 4}" text-anchor="middle">${esc(text)}</text>`;
+    // One relay arc (and one label) per region pair; "↔" when both directions use the same relay.
+    const dirs = [[l.a, l.b, l.via_ab], [l.b, l.a, l.via_ba]].filter(([, , v]) => v && pos[v]);
+    if (dirs.length === 2 && dirs[0][2] === dirs[1][2]) dirs.length = 1;
+    for (const [from, to, via] of dirs) {
+      const [ax, ay] = pos[from], [vx, vy] = pos[via], [bx, by] = pos[to];
+      relays += `<path class="relay" d="M${ax},${ay} Q${(ax + vx) / 2 + (vy - ay) * .12},${(ay + vy) / 2 - (vx - ax) * .12} ${vx},${vy} Q${(vx + bx) / 2 + (by - vy) * .12},${(vy + by) / 2 - (bx - vx) * .12} ${bx},${by}"><title>${from} → ${to} global traffic via ${via}</title></path>`;
+      const both = l.via_ab && l.via_ab === l.via_ba;
+      relayNotes[via] = (relayNotes[via] || []).concat(`${from} ${both ? "↔" : "→"} ${to} via ${via}`);
+    }
+  }
+  for (const [via, notes] of Object.entries(relayNotes)) {
+    const [vx, vy] = pos[via];
+    notes.forEach((t, i) => {
+      const y = vy < 150 ? vy - 62 - i * 16 : vy + 70 + i * 16;
+      labels += `<text class="lbl" x="${vx}" y="${y}" text-anchor="middle" style="fill:var(--accent)">${esc(t)}</text>`;
+    });
+  }
+  let nodes = "";
+  for (const r of s.regions) {
+    const [x, y] = pos[r.name], st = STATUS[r.status];
+    nodes += `<g class="node"><circle cx="${x}" cy="${y}" r="32" style="stroke:var(--series-${r.name})"/>` +
+      `<text x="${x}" y="${y + 5}" text-anchor="middle" font-weight="650" font-size="15">${esc(r.name)}</text>` +
+      `<text class="lbl" x="${x}" y="${y + (y < 150 ? -40 : 50)}" text-anchor="middle">${st.ico} ${st.label} · ${r.up}/${r.total}</text></g>`;
+  }
+  $("mapSvg").innerHTML = `<svg viewBox="0 0 420 370" role="img" aria-label="regions and link latencies">${edges}${relays}${labels}${nodes}</svg>`;
+}
+
+// ---- sparklines ----
+function spark(series, color, maxY) {
+  const n = series.length, W = 300, H = 38;
+  if (n < 2) return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><line class="base" x1="0" y1="${H}" x2="${W}" y2="${H}"/></svg>`;
+  const step = W / (120 - 1), x0 = W - (n - 1) * step;
+  const pts = series.map((v, i) => [x0 + i * step, H - 2 - (v / maxY) * (H - 6)]);
+  const line = pts.map((p) => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ");
+  const area = `M${pts[0][0]},${H} L` + line.replace(/ /g, " L") + ` L${pts[n - 1][0]},${H} Z`;
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" data-series="${series.map((v) => Math.round(v)).join(",")}" data-x0="${x0}" data-step="${step}">` +
+    `<line class="base" x1="0" y1="${H - 0.5}" x2="${W}" y2="${H - 0.5}"/>` +
+    `<path class="area" d="${area}" style="fill:${color}"/>` +
+    `<polyline class="line" points="${line}" style="stroke:${color}" vector-effect="non-scaling-stroke"/></svg>`;
+}
+document.addEventListener("mousemove", (e) => {
+  const tip = $("tip");
+  const svg = e.target.closest && e.target.closest(".spark svg[data-series]");
+  if (!svg) { tip.style.display = "none"; return; }
+  const r = svg.getBoundingClientRect(), vals = svg.dataset.series.split(",").map(Number);
+  const xv = (e.clientX - r.left) / r.width * 300, i = Math.round((xv - +svg.dataset.x0) / +svg.dataset.step);
+  if (i < 0 || i >= vals.length) { tip.style.display = "none"; return; }
+  const ago = ((vals.length - 1 - i) * 0.5).toFixed(1);
+  tip.textContent = `${vals[i].toLocaleString()} msg/s · ${ago} s ago`;
+  tip.style.display = "block"; tip.style.left = (e.clientX + 12) + "px"; tip.style.top = (e.clientY - 28) + "px";
+});
+
+function streamRow(s, label, sub) {
+  const color = `var(--series-${s.home})`;
+  const maxY = Math.max(10, ...s.series) * 1.1;
+  const stalled = s.stalled_ms > 1000;
+  const status = stalled ? `<small class="s-warning"><span class="ico">▲</span> no ack for ${(s.stalled_ms / 1000).toFixed(1)} s</small>`
+    : s.err_rate > 0 ? `<small>${s.err_rate.toFixed(0)} retries/s</small>` : `<small>&nbsp;</small>`;
+  return `<div class="stream"><div class="name"><span class="swatch" style="background:${color}"></span> ${esc(label)}<small>${esc(sub)}${s.last_err ? " · last error " + esc(s.last_err) : ""}</small></div>` +
+    `<div class="spark">${spark(s.series, color, maxY)}</div>` +
+    `<div class="rate"><b>${fmt(s.rate)}</b> <span class="muted">/s</span>${status}</div></div>`;
+}
+
+function ago(t) { const s = (Date.now() - new Date(t)) / 1000; return s < 1 ? "just now" : s < 90 ? Math.round(s) + " s ago" : Math.round(s / 60) + " min ago"; }
+
+function render(s) {
+  $("total").textContent = fmt(s.total_rate);
+  renderMap(s);
+  $("resident").innerHTML = s.streams.filter((x) => x.residency !== "global")
+    .map((x) => streamRow(x, `${x.home} resident`, `${x.topic}/${x.partition} · residency=${x.residency}`)).join("");
+  $("globalStreams").innerHTML = s.streams.filter((x) => x.residency === "global")
+    .map((x) => streamRow(x, `prices/${x.partition}`, `client in ${x.home} (any region's brokers)`)).join("");
+
+  const brokersBy = {};
+  for (const b of s.brokers) (brokersBy[b.region] ||= []).push(b);
+  $("regions").innerHTML = s.regions.map((r) => {
+    const st = STATUS[r.status], down = r.status === "down", iso = s.isolated?.includes(r.name);
+    const rows = (brokersBy[r.name] || []).map((b) => {
+      const up = b.running && b.healthy;
+      return `<li><span class="dot ${up ? "up" : "down"}" aria-hidden="true">${up ? "●" : "✕"}</span>` +
+        `<b>${esc(b.id)}</b><span class="secondary"><span style="white-space:nowrap">zone ${esc(b.zone)}${up ? "" : " · down"}</span>${b.controller ? '<span class="tag">controller</span>' : ""}` +
+        `${up && b.leads ? `<span class="tag">leads ${b.leads}</span>` : ""}</span>` +
+        (b.running ? `<button class="small danger" data-action="kill-broker" data-id="${esc(b.id)}">Kill</button>`
+          : `<button class="small" data-action="start-broker" data-id="${esc(b.id)}">Start</button>`) + `</li>`;
+    }).join("");
+    return `<section class="panel"><div class="region-head"><span class="swatch" style="background:var(--series-${r.name})"></span>` +
+      `<h3>${esc(r.name)}</h3>${badge(st)}<span class="spacer"></span><span class="muted">controller ${esc(r.controller || "—")}</span></div>` +
+      `<ul class="brokers">${rows}</ul><div class="row">` +
+      (down ? `<button data-action="start-region" data-region="${r.name}">Restart region</button>`
+        : `<button class="danger" data-action="kill-region" data-region="${r.name}">Kill region</button>`) +
+      (iso ? `<button data-action="unisolate-region" data-region="${r.name}">Reconnect</button>`
+        : `<button class="warn" data-action="isolate-region" data-region="${r.name}">Isolate region</button>`) +
+      `</div></section>`;
+  }).join("");
+
+  $("global").innerHTML = s.global.length ? s.global.map((g) =>
+    `<tr><td>prices/${g.partition}</td><td><b>${esc(g.leader)}</b></td><td><span class="swatch" style="background:var(--series-${g.region})"></span> ${esc(g.region)}</td><td class="num">${g.epoch}</td></tr>`).join("")
+    : `<tr><td colspan="4" class="muted">electing…</td></tr>`;
+
+  for (const id of ["slowA", "slowB"]) {
+    const sel = $(id);
+    if (!sel.options.length) {
+      sel.innerHTML = s.regions.map((r) => `<option>${esc(r.name)}</option>`).join("");
+      if (id === "slowB" && sel.options.length > 1) sel.selectedIndex = 1;
+    }
+  }
+
+  const a = s.audit;
+  const ast = !a.verdict ? { cls: "", ico: "…", label: "audit pending" }
+    : a.verdict === "PASS" ? { cls: "s-good", ico: "✓", label: "residency PASS" }
+    : { cls: "s-critical", ico: "✕", label: "residency " + a.verdict };
+  $("auditPill").outerHTML = `<span id="auditPill" class="badge ${ast.cls}"><span class="ico" aria-hidden="true">${ast.ico}</span>${esc(ast.label)}</span>`;
+  $("auditBig").outerHTML = `<span id="auditBig" class="badge ${ast.cls}" style="font-size:14px"><span class="ico" aria-hidden="true">${ast.ico}</span>${esc(ast.label)}</span>`;
+  $("auditWhen").textContent = a.at && !a.at.startsWith("0001") ? (a.running ? "running… · " : "") + "last run " + ago(a.at) : "";
+  $("auditCounts").textContent = a.verdict ? `${a.violations} violations · ${a.warnings} warnings (warnings: e.g. a down broker's manifest can't be fetched; its disk is still scanned)` : "";
+  $("findings").innerHTML = (a.findings || []).slice(0, 20).map((f) => `<li>${esc(f)}</li>`).join("");
+
+  $("events").innerHTML = s.events.slice().reverse().map((e) =>
+    `<li><time>${new Date(e.at).toLocaleTimeString([], { hour12: false })}</time><span class="badge">${esc(e.kind)}</span><span>${esc(e.text)}</span></li>`).join("");
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/state");
+    state = await r.json();
+    render(state);
+  } catch (e) { $("err").textContent = "dashboard unreachable"; }
+}
+refresh();
+setInterval(refresh, 600);
+</script>
+</body>
+</html>

@@ -10,7 +10,35 @@ routes around slow links, and a regional outage never freezes the surviving regi
 - [x] Milestone 3 — residency enforcement at every data path + signed manifests + `residency_audit`
 - [x] Milestone 4 — independent regions; global topics with cross-region quorum and self-elected leaders; latency-aware relay routing
 - [x] Milestone 5 — idempotent producer; `hydra-chaos` harness + correctness checker (all 6 scenarios PASS)
-- [ ] Milestone 6 — dashboard
+- [x] Milestone 6 — dashboard + one-command demo
+
+## Demo in one command
+```powershell
+.\scripts\hydra.ps1 demo
+```
+Builds everything, starts all 9 brokers (IN, EU, US × 3 zones) as local processes, creates a
+resident topic per region plus a global topic, runs a steady load (6 streams × 1k msg/s) and
+opens the dashboard at http://127.0.0.1:8080. Ctrl+C stops the dashboard and every broker.
+
+The dashboard shows each region and broker (up/down, controller, partitions led), the measured
+round trip on every inter-region link (amber when slowed, dashed red when cut off, dotted purple
+when global traffic is relayed through a third region), live acknowledged throughput per stream
+with "no ack for N s" warnings, the global partitions' leaders and epochs, the residency audit
+(re-run every 5 s) and an event log of actions, leader and controller changes.
+Buttons: **Kill region / Restart region**, **Isolate region / Reconnect**, **Kill / Start** a single
+broker, **Slow link** (pick two regions + ms) / **Restore link**, **Run audit now**, **Heal everything**.
+
+Suggested 3-minute demo script:
+1. Point at the triangle: three independent regions, ~0.5 ms links, 6k msg/s acknowledged, audit PASS.
+2. **Slow link IN ↔ EU (150 ms)** → the edge turns amber at ~300 ms and a purple path appears:
+   global traffic now goes IN ↔ EU *via US*. Throughput doesn't move. **Restore link**.
+3. **Isolate EU** → both EU links cut. EU's own resident stream keeps flowing (its data never
+   needed to leave EU); the global partition that EU led is re-elected in IN/US within ~1 s (event log).
+   **Reconnect**.
+4. **Kill region IN** → IN's resident stream stops ("no ack for N s") — by law its data can't fail
+   over abroad — while EU, US and the global topic keep going. The audit still says PASS.
+   **Restart region** → IN catches up automatically.
+5. Close with the chaos results table (below): 0 lost, 0 duplicates in every scenario.
 
 ## Quick start (Windows PowerShell; Go 1.27+)
 ```powershell
@@ -93,6 +121,8 @@ internal/manifest       signed (Ed25519) per-broker segment manifests
 internal/audit          residency audit rules and compliance report
 cmd/residency_audit     audit CLI (exit 1 on violations)
 cmd/hydra-chaos         chaos harness: real processes, faults, load, checker, results table
+cmd/hydra-dash          one-command demo: starts the cluster + load, serves the dashboard
+internal/dash           dashboard server (state polling, fault actions) + embedded page
 internal/chaos          process control, fault injection, load streams, verification, report
 internal/client         also: idempotent Producer (producer id + sequence, retry without duplicates)
 scripts/hydra.ps1       start / stop / kill / restart brokers as local processes

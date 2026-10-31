@@ -5,11 +5,13 @@
 #   .\scripts\hydra.ps1 kill -Id in-1          hard-kill one broker (simulated crash)
 #   .\scripts\hydra.ps1 restart -Id in-1       start one broker again
 #   .\scripts\hydra.ps1 status                 show which brokers are running
+#   .\scripts\hydra.ps1 demo                   build, start all 9 brokers + load + dashboard (one command)
+#   .\scripts\hydra.ps1 chaos                  build and run every chaos scenario, print the results table
 #
 # Logs go to data\logs\<id>.log, pids to data\pids\<id>.pid.
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet("start", "stop", "kill", "restart", "status")]
+    [ValidateSet("start", "stop", "kill", "restart", "status", "demo", "chaos")]
     [string]$Action,
     [string]$Region = "",
     [string]$Id = "",
@@ -51,6 +53,16 @@ function Start-Broker($b) {
 }
 
 switch ($Action) {
+    "demo" {
+        go build -o bin/ ./cmd/...
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        .\bin\hydra-dash.exe -config $Config
+    }
+    "chaos" {
+        go build -o bin/ ./cmd/...
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        .\bin\hydra-chaos.exe -config $Config
+    }
     "start" {
         go build -o bin/ ./cmd/...
         if ($LASTEXITCODE -ne 0) { exit 1 }

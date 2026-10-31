@@ -264,6 +264,20 @@ Tuning found by the harness: global partitions' election timeout lowered from 60
 (+ up to 50% jitter). At 600 ms, global stalls in kill-zone/kill-region were 950–980 ms (just under
 target); at 400 ms they are 740–780 ms with no spurious elections in 3 full runs.
 
+## Dashboard (Milestone 6)
+`hydra-dash` (`.\scripts\hydra.ps1 demo`) owns the demo: it starts the 9 broker processes, creates
+topics, runs 6 light load streams (counters only, no per-message history, so it can run for hours)
+and serves one embedded HTML page (no external libraries, works offline) polling `/api/state`
+every 600 ms. The page shows regions/brokers, a link triangle (best measured RTT per region pair;
+amber = slowed, dashed red = cut off, dotted purple = relayed via a third region), per-stream
+throughput sparklines (last 60 s, hover for values) with stall warnings, global partition leaders
++ epochs, the residency audit (every 5 s) and an event log that records actions and detected
+leader/controller changes. Actions go to `POST /api/action`; the dashboard keeps the desired
+network state (isolations + slowed links) and re-applies it to brokers after restarts, because a
+restarted broker starts with a clean network. Colours: regions use the first three categorical
+slots of the dataviz reference palette (validated all-pairs); up/degraded/isolated/down use the
+reserved status colours, always with an icon and a label.
+
 ## Competitive extras (priority order; feature freeze at hour 20)
 1. **Correctness checker** — **done in Milestone 5** (`hydra-chaos`), with the idempotent producer.
 3. **Network partition tests** — **done**: `isolate-region` chaos scenario + Go tests for an
@@ -275,7 +289,7 @@ target); at 400 ms they are 740–780 ms with no spurious elections in 3 full ru
 5. Specific, fast errors — `REGION_UNAVAILABLE` with a `reason` (e.g. `region_crashed`,
    `region_isolated`), `NOT_LEADER` with a leader hint, `STALE_EPOCH`, `NOT_ENOUGH_REPLICAS`,
    `RESIDENCY_VIOLATION`. The codes exist in `internal/api/errors.go` from Milestone 1.
-6. One command to start the whole system + dashboard buttons: kill region, isolate region, slow link.
+6. One command to start the whole system + dashboard buttons — **done in Milestone 6**.
 
 ## Measured results
 | Milestone | Scenario | Result |
