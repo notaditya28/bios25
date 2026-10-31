@@ -10,6 +10,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/notaditya28/hydra-stream/internal/fsutil"
 )
 
 // LoadOrCreateAdminKey loads the administrator's signing key, creating a key pair (private key
@@ -64,4 +66,35 @@ func SignFile(path string, key ed25519.PrivateKey, ttl time.Duration) (*Signed, 
 		doc.ExpiresAt = now.Add(ttl)
 	}
 	return Sign(doc, key)
+}
+
+// EnsureSigned makes a local cluster usable with policy:<class> topics in one command: it
+// creates the admin key pair next to pub (the cluster's configured public key) if missing, and
+// signs src into signed when signed is missing, older than src, or close to expiry. It returns
+// signed, or "" when no public key is configured.
+func EnsureSigned(pub, src, signed string) (string, error) {
+	if pub == "" {
+		return "", nil
+	}
+	key, err := LoadOrCreateAdminKey(strings.TrimSuffix(pub, ".pub")+".key", pub)
+	if err != nil {
+		return "", err
+	}
+	srcInfo, err := os.Stat(src)
+	if err != nil {
+		return "", err
+	}
+	var cur Signed
+	fresh := false
+	if st, err := os.Stat(signed); err == nil && !st.ModTime().Before(srcInfo.ModTime()) && fsutil.ReadJSON(signed, &cur) == nil {
+		fresh = Verify(&cur, key.Public().(ed25519.PublicKey)) == nil && time.Until(cur.Document.ExpiresAt) > 24*time.Hour
+	}
+	if fresh {
+		return signed, nil
+	}
+	s, err := SignFile(src, key, 30*24*time.Hour)
+	if err != nil {
+		return "", err
+	}
+	return signed, fsutil.WriteJSONAtomic(signed, s)
 }

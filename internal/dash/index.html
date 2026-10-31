@@ -222,6 +222,56 @@ td.num { font-variant-numeric: tabular-nums; }
     <h2>Events</h2>
     <ul class="events" id="events"></ul>
   </section>
+
+  <section class="panel span-4">
+    <h2>Jurisdiction policy</h2>
+    <div class="secondary" id="polVersion">no signed policy installed</div>
+    <table style="margin-top:6px"><thead><tr><th>class</th><th>stored in</th><th>may transit</th><th>min acks</th></tr></thead>
+      <tbody id="polClasses"></tbody></table>
+    <h2 style="margin-top:14px">Per-hop decisions</h2>
+    <table><thead><tr><th>region</th><th class="num">allowed</th><th class="num">denied</th></tr></thead>
+      <tbody id="decCounts"></tbody></table>
+    <ul class="findings" id="decRecent"></ul>
+  </section>
+
+  <section class="panel span-4">
+    <h2>Replication link scheduler</h2>
+    <div class="row">
+      <input id="capMbps" type="number" min="0" step="10" value="40" aria-label="link capacity in Mbit/s"> <span class="muted">Mbit/s</span>
+      <button class="warn" id="capApply">Cap links</button>
+      <button id="capClear">Uncap</button>
+    </div>
+    <table style="margin-top:8px"><thead><tr><th>link</th><th class="num">cap</th><th class="num">recovery weight</th><th class="num">live wait p95</th></tr></thead>
+      <tbody id="flowLinks"></tbody></table>
+    <p class="muted" style="font-size:12px;margin-bottom:0">Live traffic is kept under a 20 ms queueing target; catch-up traffic gets whatever is left
+      (its weight is raised while live is healthy, cut when live slows). Unlimited links are never shaped.</p>
+  </section>
+
+  <section class="panel span-4">
+    <h2>Recovery forecast</h2>
+    <table><thead><tr><th>replica behind</th><th class="num">backlog</th><th class="num">clears in</th></tr></thead>
+      <tbody id="fcBacklogs"></tbody></table>
+    <ul class="findings" id="fcRecs"></ul>
+  </section>
+
+  <section class="panel span-12">
+    <h2>What-if simulator</h2>
+    <div class="row">
+      <select id="simPreset" aria-label="scenario">
+        <option value="region_down:IN">IN goes offline</option>
+        <option value="region_isolate:US">US cut off from the others</option>
+        <option value="link_slow:IN:EU:10">IN↔EU link 10x slower</option>
+        <option value="transit_remove:eu-personal:US">remove US from eu-personal transit</option>
+        <option value="storage_remove:financial:EU">remove EU from financial storage</option>
+        <option value="traffic:5">traffic grows 5x</option>
+        <option value="storage_full:EU">EU storage full</option>
+        <option value="recovering:EU,recovering:US">EU and US recover after 5 min away</option>
+      </select>
+      <input id="simSteps" style="min-width:260px" placeholder="or steps, e.g. region_down:EU,traffic:2" aria-label="custom steps">
+      <button id="simRun">Predict</button>
+    </div>
+    <div id="simOut" class="secondary" style="margin-top:10px">Predicts writability, paths, backlog and policy conflicts on the live topology using the brokers' own placement, quorum, policy and routing code. Nothing is changed.</div>
+  </section>
 </main>
 <div class="tip" id="tip"></div>
 
@@ -406,6 +456,56 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 600);
+
+// ---- features ----
+const list = (xs) => xs == null ? "any" : xs.join(", ");
+const mb = (b) => b >= 1e6 ? (b / 1e6).toFixed(1) + " MB" : b >= 1e3 ? (b / 1e3).toFixed(0) + " KB" : Math.round(b) + " B";
+const secs = (s) => s < 0 ? "growing" : s < 1 ? "<1 s" : s < 90 ? Math.round(s) + " s" : Math.round(s / 60) + " min";
+function renderFeatures(f) {
+  $("polVersion").textContent = f.policy_version ? `signed document v${f.policy_version} · signature verified on every broker (Ed25519)` : "no signed policy installed — policy:<class> topics fail closed";
+  $("polClasses").innerHTML = (f.classes || []).map((c) => {
+    const st = c.storage_regions.includes("*") ? null : c.storage_regions;
+    const tr = st == null ? null : st.concat(c.transit_regions || []);
+    return `<tr><td>${esc(c.class)}</td><td>${esc(list(st))}</td><td>${esc(list(tr))}</td><td>${esc(c.min_acks || "quorum")}</td></tr>`;
+  }).join("");
+  const regs = Object.keys(f.regions).sort();
+  $("decCounts").innerHTML = regs.map((r) => `<tr><td><span class="swatch" style="background:var(--series-${r})"></span> ${esc(r)}</td><td class="num">${fmt(f.regions[r].allows)}</td><td class="num">${fmt(f.regions[r].denies)}</td></tr>`).join("");
+  const recent = regs.flatMap((r) => f.regions[r].decisions.filter((d) => d.decision === "deny")).slice(0, 6);
+  $("decRecent").innerHTML = recent.map((d) => `<li>DENY ${esc(d.topic)} at ${esc(d.broker)} (${esc(d.hop)}${d.peer_region ? " → " + esc(d.peer_region) : ""}): ${esc(d.reason)}</li>`).join("") || `<li>no denials yet</li>`;
+  $("flowLinks").innerHTML = regs.flatMap((r) => f.regions[r].links.map((l) =>
+    `<tr><td>${esc(r)} → ${esc(l.to)}</td><td class="num">${l.capacity_mbps ? Math.round(l.capacity_mbps) + " Mb/s" : "unlimited"}</td><td class="num">${l.capacity_mbps ? l.recovery_weight.toFixed(2) : "–"}</td><td class="num">${l.capacity_mbps ? l.live_p95_ms.toFixed(1) + " ms" : "–"}</td></tr>`)).join("");
+  const bl = regs.flatMap((r) => f.regions[r].backlogs).sort((a, b) => b.bytes - a.bytes).slice(0, 8);
+  $("fcBacklogs").innerHTML = bl.map((b) => `<tr><td>${esc(b.partition)} on ${esc(b.follower)}</td><td class="num">${mb(b.bytes)}</td><td class="num">${secs(b.clear_s)}</td></tr>`).join("") || `<tr><td colspan="3" class="muted">every replica is caught up</td></tr>`;
+  const recs = [...new Set(regs.flatMap((r) => f.regions[r].recommendations))].slice(0, 6);
+  $("fcRecs").innerHTML = recs.map((x) => `<li>${esc(x)}</li>`).join("");
+}
+async function refreshFeatures() {
+  try { renderFeatures(await (await fetch("/api/features")).json()); } catch (e) { /* the header reports reachability */ }
+}
+refreshFeatures();
+setInterval(refreshFeatures, 1500);
+$("capApply").onclick = () => post({ action: "cap-links", mbps: +$("capMbps").value });
+$("capClear").onclick = () => post({ action: "cap-links", mbps: 0 });
+$("simRun").onclick = async () => {
+  const steps = ($("simSteps").value.trim() || $("simPreset").value).split(",").map((s) => s.trim()).filter(Boolean);
+  $("simOut").textContent = "predicting…";
+  try {
+    const r = await fetch("/api/simulate", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ steps, outage_seconds: steps.some((s) => s.startsWith("recovering")) ? 300 : 60 }) });
+    if (!r.ok) { $("simOut").textContent = await r.text(); return; }
+    const p = await r.json();
+    const lost = p.partitions.filter((x) => !x.writable);
+    const via = p.routes.filter((x) => x.via);
+    const li = (xs) => xs.length ? `<ul class="findings">${xs.map((x) => `<li>${x}</li>`).join("")}</ul>` : "";
+    $("simOut").innerHTML =
+      `<div class="row"><span class="badge ${lost.length ? "s-warning" : "s-good"}">${p.writable_partitions} / ${p.total_partitions} partitions writable</span>` +
+      (p.peak_link ? `<span class="muted">busiest link ${esc(p.peak_link)} at ${p.peak_link_util_pct}% of capacity</span>` : "") + `</div>` +
+      li(lost.map((x) => `${esc(x.topic)}/${x.partition}: ${esc(x.reason)}`)) +
+      li(via.map((x) => `${esc(x.from)}→${esc(x.to)} relayed via ${esc(x.via)} (${x.path_ms} ms vs ${x.direct_ms} ms direct)${x.forbidden_for ? " — not allowed for " + esc(x.forbidden_for.join(", ")) : ""}`)) +
+      li(p.recovery.map((x) => `${esc(x.region)}: ${x.replicas} replicas behind, ${mb(x.backlog_bytes)}, catch-up ${secs(x.catch_up_s)}`)) +
+      li(p.policy_findings.concat(p.recommendations).map(esc));
+  } catch (e) { $("simOut").textContent = "dashboard unreachable"; }
+};
 </script>
 </body>
 </html>

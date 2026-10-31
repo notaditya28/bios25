@@ -26,9 +26,11 @@ type Procs struct {
 	Bin      string // hydra-broker binary
 	DataRoot string
 	LogDir   string
+	Policies string // signed policy document each broker installs at start ("" = none)
 
-	mu   sync.Mutex
-	cmds map[string]*exec.Cmd
+	mu      sync.Mutex
+	cmds    map[string]*exec.Cmd
+	capMbps float64
 }
 
 type BrokerRef struct {
@@ -88,7 +90,11 @@ func (p *Procs) Start(id string) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(p.Bin, "-config", p.Config, "-id", id, "-data", p.DataRoot)
+	args := []string{"-config", p.Config, "-id", id, "-data", p.DataRoot}
+	if p.Policies != "" {
+		args = append(args, "-policies", p.Policies)
+	}
+	cmd := exec.Command(p.Bin, args...)
 	cmd.Stdout, cmd.Stderr = logf, logf
 	if err := cmd.Start(); err != nil {
 		logf.Close()
@@ -199,8 +205,9 @@ func (p *Procs) WaitHealthy(ctx context.Context, timeout time.Duration) error {
 }
 
 type netState struct {
-	Blocked  []string         `json:"blocked"`
-	DelaysMs map[string]int64 `json:"delays_ms,omitempty"`
+	Blocked      []string           `json:"blocked"`
+	DelaysMs     map[string]int64   `json:"delays_ms,omitempty"`
+	CapacityMbps map[string]float64 `json:"link_capacity_mbps,omitempty"`
 }
 
 // SetNet applies simulated network state on every running broker: blocked(a) lists the
@@ -210,7 +217,14 @@ func (p *Procs) SetNet(blocked func(a, b BrokerRef) bool, delayMs func(a, b Brok
 		if !p.Up(a.ID) {
 			continue
 		}
-		s := netState{Blocked: []string{}, DelaysMs: map[string]int64{}}
+		s := netState{Blocked: []string{}, DelaysMs: map[string]int64{}, CapacityMbps: map[string]float64{}}
+		if mbps := p.linkMbps(); mbps > 0 {
+			for _, r := range p.Regions() {
+				if r != a.Region {
+					s.CapacityMbps[r] = mbps
+				}
+			}
+		}
 		for _, b := range p.Brokers() {
 			if a.ID == b.ID {
 				continue
@@ -230,6 +244,19 @@ func (p *Procs) SetNet(blocked func(a, b BrokerRef) bool, delayMs func(a, b Brok
 }
 
 func (p *Procs) HealNet() { p.SetNet(nil, nil) }
+
+// SetLinkMbps caps every inter-region link at mbps (0 = unlimited) from the next SetNet on.
+func (p *Procs) SetLinkMbps(mbps float64) {
+	p.mu.Lock()
+	p.capMbps = mbps
+	p.mu.Unlock()
+}
+
+func (p *Procs) linkMbps() float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.capMbps
+}
 
 type PartitionState struct {
 	Topic     string `json:"topic"`

@@ -22,6 +22,7 @@ import (
 
 	"github.com/notaditya28/hydra-stream/internal/chaos"
 	"github.com/notaditya28/hydra-stream/internal/config"
+	"github.com/notaditya28/hydra-stream/internal/policy"
 )
 
 func main() {
@@ -33,6 +34,7 @@ func main() {
 	keep := flag.Bool("keep", false, "leave the cluster running when done")
 	faulted := flag.String("region", "IN", "region targeted by region-level faults")
 	hold := flag.Duration("hold", 6*time.Second, "how long each fault lasts")
+	policySrc := flag.String("policies", "configs/policies.json", "policy document to sign and install on every broker (\"\" = none)")
 	flag.Parse()
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
@@ -47,6 +49,14 @@ func main() {
 		fail(err)
 	}
 	p := &chaos.Procs{Cluster: cluster, Config: *cfgPath, Bin: *bin, DataRoot: *dataRoot, LogDir: filepath.Join(*dataRoot, "logs")}
+	if *policySrc != "" {
+		signed, err := policy.EnsureSigned(cluster.PolicyKeyPath(), *policySrc, strings.TrimSuffix(*policySrc, ".json")+".signed.json")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "policies:", err)
+			os.Exit(2)
+		}
+		p.Policies = signed
+	}
 	if err := p.StartAll(); err != nil {
 		fail(err)
 	}

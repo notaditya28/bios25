@@ -594,7 +594,7 @@ func (w *world) recommend(pred *Prediction) {
 		worst = math.Max(worst, r.CatchUpSecs)
 	}
 	if worst > 0 {
-		pred.Recommendations = append(pred.Recommendations, fmt.Sprintf("recovering replicas will need up to ~%s to catch up after the outage; keep the adaptive bandwidth controller on so live traffic isn't starved.", forecast.HumanDuration(worst)))
+		pred.Recommendations = append(pred.Recommendations, fmt.Sprintf("recovering replicas will need up to %s to catch up after the outage; keep the adaptive bandwidth controller on so live traffic isn't starved.", forecast.HumanDuration(worst)))
 	}
 	for _, r := range pred.Routes {
 		if len(r.Forbidden) > 0 {

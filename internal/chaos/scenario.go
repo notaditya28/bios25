@@ -232,7 +232,7 @@ func addrs(bs []BrokerRef) []string {
 }
 
 func runAudit(ctx context.Context, p *Procs, trust string) string {
-	rep, err := audit.Run(ctx, p.Cluster, audit.Options{DataRoot: p.DataRoot, Online: true, TrustFile: trust})
+	rep, err := audit.Run(ctx, p.Cluster, audit.Options{DataRoot: p.DataRoot, Online: true, TrustFile: trust, PolicyFile: p.Policies})
 	if err != nil {
 		return "ERROR"
 	}

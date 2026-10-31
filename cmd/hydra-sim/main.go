@@ -144,7 +144,7 @@ func print(p *sim.Prediction) {
 		for _, r := range p.Recovery {
 			eta := "never at current rates"
 			if r.CatchUpSecs >= 0 {
-				eta = "~" + forecast.HumanDuration(r.CatchUpSecs)
+				eta = forecast.HumanDuration(r.CatchUpSecs)
 			}
 			fmt.Printf("  %s: %d replicas behind, %.0f records (%.1f MB), catch-up %s\n", r.Region, r.Replicas, r.Records, r.Bytes/1e6, eta)
 		}

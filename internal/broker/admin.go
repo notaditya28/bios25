@@ -45,18 +45,10 @@ func (b *Broker) registerAdminExtra(mux *http.ServeMux) {
 		if !httpapi.Decode(w, r, &s) {
 			return
 		}
-		if err := b.policy.Install(&s); err != nil {
-			e := api.Errorf(api.CodeInvalidRequest, "policy document refused: %v", err)
-			e.Reason = "policy_rejected"
-			httpapi.WriteError(w, e)
-			return
-		}
-		if err := fsutil.WriteJSONAtomic(filepath.Join(b.cfg.DataDir, policyFile), &s); err != nil {
+		if err := b.InstallPolicy(&s); err != nil {
 			httpapi.WriteError(w, err)
 			return
 		}
-		b.trail.Record(trail.Decision{Broker: b.cfg.Info.ID, Hop: "policy-install", Policy: "document",
-			PolicyVersion: s.Document.Version, Decision: trail.Allow, Reason: "signature verified"})
 		httpapi.WriteJSON(w, http.StatusOK, map[string]any{"installed_version": b.policy.Current().Document.Version})
 	})
 	// The per-hop decision trail.
@@ -214,4 +206,19 @@ func (b *Broker) writeMetrics(w io.Writer) {
 	}
 	gauge("hydra_disk_used_bytes", "Bytes in this broker's data directory.", float64(fc.Disk.UsedBytes), "")
 	gauge("hydra_disk_full_seconds", "Forecast time until the disk budget is reached (-1 = not growing/no budget).", fc.Disk.FullSeconds, "")
+}
+
+// InstallPolicy verifies and installs a signed policy document and persists it for restarts.
+func (b *Broker) InstallPolicy(s *policy.Signed) error {
+	if err := b.policy.Install(s); err != nil {
+		e := api.Errorf(api.CodeInvalidRequest, "policy document refused: %v", err)
+		e.Reason = "policy_rejected"
+		return e
+	}
+	if err := fsutil.WriteJSONAtomic(filepath.Join(b.cfg.DataDir, policyFile), s); err != nil {
+		return err
+	}
+	b.trail.Record(trail.Decision{Broker: b.cfg.Info.ID, Hop: "policy-install", Policy: "document",
+		PolicyVersion: s.Document.Version, Decision: trail.Allow, Reason: "signature verified"})
+	return nil
 }

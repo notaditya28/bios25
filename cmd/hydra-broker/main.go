@@ -18,6 +18,7 @@ import (
 	"github.com/notaditya28/hydra-stream/internal/broker"
 	"github.com/notaditya28/hydra-stream/internal/config"
 	"github.com/notaditya28/hydra-stream/internal/flow"
+	"github.com/notaditya28/hydra-stream/internal/fsutil"
 	"github.com/notaditya28/hydra-stream/internal/policy"
 	"github.com/notaditya28/hydra-stream/internal/seglog"
 )
@@ -31,9 +32,10 @@ func main() {
 	flowMode := flag.String("flow", "adaptive", "inter-region bandwidth scheduling: adaptive | fifo | fixed")
 	diskMB := flag.Int64("disk-budget-mb", 10240, "storage budget for time-to-full forecasts")
 	noDedup := flag.Bool("no-dedup", false, "disable wire-level payload dedup for cross-region replication")
+	policies := flag.String("policies", "", "signed policy document to install at start if newer than the stored one (signature is verified)")
 	flag.Parse()
 
-	opts := options{flow: flow.Config{Mode: flow.Mode(*flowMode)}, diskBudget: *diskMB << 20, noDedup: *noDedup}
+	opts := options{flow: flow.Config{Mode: flow.Mode(*flowMode)}, diskBudget: *diskMB << 20, noDedup: *noDedup, policies: *policies}
 	if err := run(*cfgPath, *id, *dataRoot, seglog.Config{SegmentBytes: *segBytes, Fsync: *fsync}, opts); err != nil {
 		slog.Error("broker failed", "err", err)
 		os.Exit(1)
@@ -44,6 +46,7 @@ type options struct {
 	flow       flow.Config
 	diskBudget int64
 	noDedup    bool
+	policies   string
 }
 
 func run(cfgPath, id, dataRoot string, logCfg seglog.Config, opts options) error {
@@ -93,6 +96,18 @@ func run(cfgPath, id, dataRoot string, logCfg seglog.Config, opts options) error
 		return err
 	}
 	defer b.Close()
+	if opts.policies != "" {
+		var s policy.Signed
+		if err := fsutil.ReadJSON(opts.policies, &s); err != nil {
+			slog.Warn("policy file not loaded", "file", opts.policies, "err", err)
+		} else if cur := b.Policy().Current(); cur == nil || cur.Document.Version < s.Document.Version {
+			if err := b.InstallPolicy(&s); err != nil {
+				slog.Warn("policy file refused", "file", opts.policies, "err", err)
+			} else {
+				slog.Info("policy document installed", "version", s.Document.Version, "classes", len(s.Document.Policies))
+			}
+		}
+	}
 
 	srv := &http.Server{Addr: bc.Addr, Handler: b.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

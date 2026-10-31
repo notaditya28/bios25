@@ -145,6 +145,8 @@ func HumanDuration(s float64) string {
 	switch {
 	case s < 0 || math.IsInf(s, 0):
 		return "never (not shrinking)"
+	case s < 1:
+		return "under a second"
 	case s < 90:
 		return time.Duration(s * float64(time.Second)).Round(time.Second).String()
 	case s < 2*3600:

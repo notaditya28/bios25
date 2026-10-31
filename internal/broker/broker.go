@@ -645,6 +645,13 @@ func (b *Broker) unknownTopic(name string) error {
 		_, err := b.policy.Resolve(ts.Residency)
 		return err // fail closed: can't even evaluate its policy here
 	}
+	if eff, err := b.policy.Resolve(ts.Residency); err == nil && !eff.CanTransit(b.cfg.Info.Region) {
+		// The request reached a region this data may not even pass through: it is refused here
+		// (not stored, not forwarded) and the refusal goes on the record.
+		b.stats.policyDenied.Add(1)
+		b.trail.Record(trail.Decision{Broker: b.cfg.Info.ID, Topic: name, Partition: -1, Hop: "entry", Policy: ts.Residency,
+			PolicyVersion: eff.Version, Decision: trail.Deny, Reason: fmt.Sprintf("transit_not_permitted: client redirected to %v", regions)})
+	}
 	var addrs, reachable []string
 	for _, r := range regions {
 		if r == b.cfg.Info.Region {

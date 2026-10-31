@@ -290,7 +290,7 @@ func (d *Dash) runAudit(ctx context.Context) {
 	d.auditV.Running = true
 	prev := d.auditV.Verdict
 	d.mu.Unlock()
-	rep, err := audit.Run(ctx, d.p.Cluster, audit.Options{DataRoot: d.p.DataRoot, Online: true, TrustFile: d.trustFile, Timeout: 3 * time.Second})
+	rep, err := audit.Run(ctx, d.p.Cluster, audit.Options{DataRoot: d.p.DataRoot, Online: true, TrustFile: d.trustFile, Timeout: 3 * time.Second, PolicyFile: d.p.Policies})
 	v := auditView{At: time.Now()}
 	if err != nil {
 		v.Verdict = "ERROR"
@@ -347,12 +347,13 @@ func (d *Dash) applyNet() {
 }
 
 type actionReq struct {
-	Action string `json:"action"`
-	Region string `json:"region"`
-	ID     string `json:"id"`
-	A      string `json:"a"`
-	B      string `json:"b"`
-	Ms     int64  `json:"ms"`
+	Action string  `json:"action"`
+	Region string  `json:"region"`
+	ID     string  `json:"id"`
+	A      string  `json:"a"`
+	B      string  `json:"b"`
+	Ms     int64   `json:"ms"`
+	Mbps   float64 `json:"mbps"`
 }
 
 func (d *Dash) act(ctx context.Context, req actionReq) error {
@@ -412,12 +413,21 @@ func (d *Dash) act(ctx context.Context, req actionReq) error {
 		d.mu.Lock()
 		d.isolated, d.slow = map[string]bool{}, map[string]int64{}
 		d.mu.Unlock()
+		d.p.SetLinkMbps(0)
 		for _, b := range d.p.Brokers() {
 			_ = d.p.Start(b.ID)
 		}
 		d.applyNet()
 		go d.reapplyNetSoon()
 		d.logEvent("action", "healed everything: all brokers started, all links restored")
+	case "cap-links":
+		d.p.SetLinkMbps(req.Mbps)
+		d.applyNet()
+		if req.Mbps > 0 {
+			d.logEvent("action", "capped every inter-region link at %.0f Mbit/s (the replication scheduler now has to share it)", req.Mbps)
+		} else {
+			d.logEvent("action", "removed the inter-region bandwidth cap")
+		}
 	case "audit":
 		go d.runAudit(ctx)
 	default:
@@ -590,6 +600,7 @@ func (d *Dash) Handler(ctx context.Context) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"ok":true}`))
 	})
+	d.featureRoutes(mux)
 	return mux
 }
 

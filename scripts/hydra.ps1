@@ -45,7 +45,7 @@ function Get-BrokerProcess($id) {
 
 function Start-Broker($b) {
     if (Get-BrokerProcess $b.Id) { Write-Host "$($b.Id) already running"; return }
-    $p = Start-Process -FilePath .\bin\hydra-broker.exe -ArgumentList "-config", $Config, "-id", $b.Id `
+    $p = Start-Process -FilePath .\bin\hydra-broker.exe -ArgumentList "-config", $Config, "-id", $b.Id, "-policies", "configs/policies.signed.json" `
         -RedirectStandardError "data\logs\$($b.Id).log" -RedirectStandardOutput "data\logs\$($b.Id).out" `
         -WindowStyle Hidden -PassThru
     Set-Content "data\pids\$($b.Id).pid" $p.Id
@@ -73,6 +73,8 @@ switch ($Action) {
     }
     "start" {
         go build -o bin/ ./cmd/...
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        .\bin\hydra-policy.exe ensure -config $Config   # admin key + signed policies (once)
         if ($LASTEXITCODE -ne 0) { exit 1 }
         Get-Brokers | ForEach-Object { Start-Broker $_ }
     }

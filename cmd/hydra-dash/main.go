@@ -15,11 +15,15 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
+	"github.com/notaditya28/hydra-stream/internal/api"
 	"github.com/notaditya28/hydra-stream/internal/chaos"
+	"github.com/notaditya28/hydra-stream/internal/client"
 	"github.com/notaditya28/hydra-stream/internal/config"
 	"github.com/notaditya28/hydra-stream/internal/dash"
+	"github.com/notaditya28/hydra-stream/internal/policy"
 )
 
 func main() {
@@ -30,6 +34,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8080", "dashboard listen address")
 	open := flag.Bool("open", true, "open the dashboard in a browser")
 	rate := flag.Int("rate", 1000, "messages per second per load stream")
+	policySrc := flag.String("policies", "configs/policies.json", "policy document to sign and install on every broker (\"\" = none)")
 	flag.Parse()
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
@@ -49,6 +54,14 @@ func main() {
 		}
 	}
 	p := &chaos.Procs{Cluster: cluster, Config: *cfgPath, Bin: *bin, DataRoot: *dataRoot, LogDir: filepath.Join(*dataRoot, "logs")}
+	if *policySrc != "" {
+		signed, err := policy.EnsureSigned(cluster.PolicyKeyPath(), *policySrc, strings.TrimSuffix(*policySrc, ".json")+".signed.json")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "policies:", err)
+			os.Exit(2)
+		}
+		p.Policies = signed
+	}
 	if err := p.StartAll(); err != nil {
 		fail(err)
 	}
@@ -61,6 +74,9 @@ func main() {
 		fail(err)
 	}
 
+	if p.Policies != "" {
+		go policyDemo(ctx, p)
+	}
 	d := dash.New(p, filepath.Join(*dataRoot, "audit-trust.json"))
 	const batch = 20
 	interval := time.Duration(float64(time.Second) * batch / float64(max(*rate, 1)))
@@ -99,4 +115,47 @@ func openBrowser(url string) {
 func fail(err error) {
 	fmt.Fprintln(os.Stderr, "error:", err)
 	os.Exit(2)
+}
+
+// policyDemo creates topics under signed policy classes and keeps exercising them: allowed
+// payments from IN and EU, and a US client that keeps trying to send financial data (denied
+// at entry: US may neither store nor carry it), so the dashboard shows live decisions.
+func policyDemo(ctx context.Context, p *chaos.Procs) {
+	topics := []api.TopicConfig{
+		{Name: "payments", Partitions: 2, Residency: "policy:financial"},
+		{Name: "eu-profiles", Partitions: 1, Residency: "policy:eu-personal"},
+		{Name: "sensor-telemetry", Partitions: 3, Residency: "policy:telemetry"},
+	}
+	first := func(region string) string { return p.Region(region)[0].Addr }
+	for _, t := range topics {
+		home := "EU"
+		for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline) && ctx.Err() == nil; time.Sleep(300 * time.Millisecond) {
+			if _, err := client.New(first(home)).CreateTopic(ctx, t); err == nil || api.CodeOf(err) == api.CodeTopicExists {
+				break
+			}
+		}
+	}
+	tk := time.NewTicker(time.Second)
+	defer tk.Stop()
+	for i := 0; ctx.Err() == nil; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tk.C:
+		}
+		for _, r := range []string{"IN", "EU", "US"} {
+			for _, b := range p.Region(r) {
+				if !p.Up(b.ID) {
+					continue
+				}
+				c := client.New(b.Addr)
+				cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				part := i % 2
+				c.ProduceRequest(cctx, "payments", api.ProduceRequest{Records: []api.ProduceRecord{{Partition: &part, Value: fmt.Sprintf("txn-%s-%d", r, i)}}})
+				c.ProduceRequest(cctx, "eu-profiles", api.ProduceRequest{Records: []api.ProduceRecord{{Value: fmt.Sprintf("profile-%s-%d", r, i)}}})
+				cancel()
+				break
+			}
+		}
+	}
 }

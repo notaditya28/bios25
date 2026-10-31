@@ -2,6 +2,7 @@
 //
 //	hydra-policy init                       create the admin key pair (configs/policy-admin.key/.pub)
 //	hydra-policy sign  [-in configs/policies.json] [-out configs/policies.signed.json] [-ttl 720h]
+//	hydra-policy ensure                     init + sign only if missing, stale or expiring
 //	hydra-policy push  [-signed configs/policies.signed.json]   install on every broker in the config
 //	hydra-policy show  [-b 127.0.0.1:9101]                       print a broker's installed policy
 package main
@@ -23,7 +24,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: hydra-policy init|sign|push|show [flags]")
+		fmt.Fprintln(os.Stderr, "usage: hydra-policy init|sign|ensure|push|show [flags]")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet(os.Args[1], flag.ExitOnError)
@@ -53,6 +54,14 @@ func main() {
 					fmt.Printf("signed %d policies as version %d (expires %s) -> %s\n",
 						len(s.Document.Policies), s.Document.Version, s.Document.ExpiresAt.Format(time.RFC3339), *out)
 				}
+			}
+		}
+	case "ensure": // key pair + signed document, only re-signing when needed (used by scripts)
+		var cluster *config.Cluster
+		if cluster, err = config.Load(*cfgPath); err == nil {
+			var path string
+			if path, err = policy.EnsureSigned(cluster.PolicyKeyPath(), *in, *out); err == nil && path != "" {
+				fmt.Println("signed policies ready:", path)
 			}
 		}
 	case "push":
