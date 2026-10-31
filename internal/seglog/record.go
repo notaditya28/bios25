@@ -8,24 +8,32 @@ import (
 
 // Record is a single message in a partition log.
 type Record struct {
-	Offset    uint64
-	Epoch     uint64 // leader epoch that wrote the record; used to truncate divergent tails after failover
-	Timestamp int64  // unix milliseconds
-	Flags     uint8
-	Key       []byte
-	Value     []byte
+	Offset     uint64
+	Epoch      uint64 // leader epoch that wrote the record; used to truncate divergent tails after failover
+	Timestamp  int64  // unix milliseconds
+	Flags      uint8
+	ProducerID uint64 // idempotent producer that wrote it (0 = none)
+	Seq        uint64 // that producer's sequence number for this partition
+	Key        []byte
+	Value      []byte
 }
 
 // FlagControl marks internal records (e.g. the marker a new leader writes); consumers skip them.
 const FlagControl uint8 = 1
 
+// FlagBatchStart marks the first record of an idempotent producer's batch, so every replica
+// can recover the exact batch boundaries from its log.
+const FlagBatchStart uint8 = 2
+
 func (r *Record) IsControl() bool { return r.Flags&FlagControl != 0 }
 
 // On-disk framing: u32 body length | u32 CRC32-C(body) | body
-// body: u64 offset | u64 epoch | i64 timestamp | u8 flags | u32 keylen | key | u32 vallen | value
+// body: u64 offset | u64 epoch | i64 timestamp | u8 flags | u64 producer id | u64 seq |
+//
+//	u32 keylen | key | u32 vallen | value
 const (
 	headerSize    = 8
-	fixedBodySize = 8 + 8 + 8 + 1 + 4 + 4
+	fixedBodySize = 8 + 8 + 8 + 1 + 8 + 8 + 4 + 4
 
 	// MaxRecordSize bounds len(key)+len(value) of a single record.
 	MaxRecordSize = 8 << 20
@@ -50,6 +58,8 @@ func appendEncoded(dst []byte, r *Record) []byte {
 	dst = be.AppendUint64(dst, r.Epoch)
 	dst = be.AppendUint64(dst, uint64(r.Timestamp))
 	dst = append(dst, r.Flags)
+	dst = be.AppendUint64(dst, r.ProducerID)
+	dst = be.AppendUint64(dst, r.Seq)
 	dst = be.AppendUint32(dst, uint32(len(r.Key)))
 	dst = append(dst, r.Key...)
 	dst = be.AppendUint32(dst, uint32(len(r.Value)))
@@ -64,12 +74,14 @@ func decodeBody(body []byte) (Record, error) {
 		return Record{}, errCorrupt
 	}
 	r := Record{
-		Offset:    be.Uint64(body[0:]),
-		Epoch:     be.Uint64(body[8:]),
-		Timestamp: int64(be.Uint64(body[16:])),
-		Flags:     body[24],
+		Offset:     be.Uint64(body[0:]),
+		Epoch:      be.Uint64(body[8:]),
+		Timestamp:  int64(be.Uint64(body[16:])),
+		Flags:      body[24],
+		ProducerID: be.Uint64(body[25:]),
+		Seq:        be.Uint64(body[33:]),
 	}
-	p := 25
+	p := 41
 	kl := int(be.Uint32(body[p:]))
 	p += 4
 	if kl > len(body)-p-4 {

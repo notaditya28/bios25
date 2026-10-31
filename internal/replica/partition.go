@@ -47,7 +47,7 @@ func DefaultTiming() Timing {
 		ProduceTimeout:  2000 * time.Millisecond,
 		RPCTimeout:      1000 * time.Millisecond,
 		MaxBatch:        5000,
-		ElectionTimeout: 600 * time.Millisecond,
+		ElectionTimeout: 400 * time.Millisecond,
 	}
 }
 
@@ -104,6 +104,8 @@ type Partition struct {
 	lastHeard   time.Time // last valid message from a leader (or our own vote/campaign)
 	leaderSince time.Time
 	stopElect   context.CancelFunc
+
+	producers map[uint64]*producerState // idempotent producers' recent batches (see producers.go)
 }
 
 func openPartition(dir string, key meta.PartKey, res, self string, logCfg seglog.Config, send Sender, timing Timing, guard *residency.Guard) (*Partition, error) {
@@ -121,6 +123,7 @@ func openPartition(dir string, key meta.PartKey, res, self string, logCfg seglog
 		return nil, err
 	}
 	p.epoch, p.votedFor = st.Epoch, st.VotedFor
+	p.rebuildProducersLocked()
 	return p, nil
 }
 
@@ -300,7 +303,9 @@ func (p *Partition) quorumAliveLocked() bool {
 }
 
 // Produce appends records as leader and waits until a majority of replicas has them.
-func (p *Partition) Produce(ctx context.Context, recs []seglog.Record) (uint64, error) {
+// With pid != 0 the batch is idempotent: a retry of a batch already in the log (same producer,
+// same baseSeq) is not appended again; the call waits for and returns the original offsets.
+func (p *Partition) Produce(ctx context.Context, recs []seglog.Record, pid, baseSeq uint64) (uint64, error) {
 	p.mu.Lock()
 	if p.role != RoleLeader {
 		err := p.notLeaderLocked()
@@ -314,12 +319,30 @@ func (p *Partition) Produce(ctx context.Context, recs []seglog.Record) (uint64, 
 		return 0, e
 	}
 	epoch := p.leaderEpoch
-	for i := range recs {
-		recs[i].Epoch = epoch
+	var base uint64
+	var err error
+	dup := false
+	if pid != 0 {
+		base, dup, err = p.dedupLocked(pid, baseSeq, len(recs))
+		if err != nil {
+			p.mu.Unlock()
+			return 0, err
+		}
 	}
-	base, err := p.log.Append(recs)
-	if err == nil {
-		p.advanceHWLocked() // a single-replica partition commits immediately
+	if !dup {
+		for i := range recs {
+			recs[i].Epoch, recs[i].ProducerID, recs[i].Seq = epoch, pid, baseSeq+uint64(i)
+		}
+		if pid != 0 && len(recs) > 0 {
+			recs[0].Flags |= seglog.FlagBatchStart
+		}
+		base, err = p.log.Append(recs)
+		if err == nil {
+			if pid != 0 {
+				p.trackLocked(recs)
+			}
+			p.advanceHWLocked() // a single-replica partition commits immediately
+		}
 	}
 	p.mu.Unlock()
 	if err != nil {
@@ -459,6 +482,7 @@ func (p *Partition) handleAppend(req *AppendRequest) (*AppendResponse, error) {
 				return nil, api.Errorf(api.CodeInternal, "truncate %s: %v", p.Key, err)
 			}
 			slog.Info("truncated divergent log tail", "partition", p.Key, "to", to, "was", leo)
+			p.rebuildProducersLocked()
 			return &AppendResponse{Epoch: p.epoch, EndOffset: p.log.EndOffset()}, nil
 		}
 	}
@@ -489,12 +513,14 @@ func (p *Partition) handleAppend(req *AppendRequest) (*AppendResponse, error) {
 			return nil, api.Errorf(api.CodeInternal, "truncate %s: %v", p.Key, err)
 		}
 		p.hw = min(p.hw, recs[i].Offset)
+		p.rebuildProducersLocked()
 	}
 	recs = recs[i:]
 	if len(recs) > 0 {
 		if err := p.log.AppendWithOffsets(recs); err != nil {
 			return nil, api.Errorf(api.CodeInternal, "append %s: %v", p.Key, err)
 		}
+		p.trackLocked(recs)
 	}
 	match := req.PrevOffset + uint64(len(req.Records))
 	if hw := min(req.HW, match); hw > p.hw {

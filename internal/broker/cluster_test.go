@@ -398,13 +398,18 @@ type ack struct {
 
 // load produces batches to one partition until ctx ends, recording every acknowledged message.
 func load(ctx context.Context, cs []*client.Client, topic string, part, batch int) (acks []ack, maxStall time.Duration) {
+	var addrs []string
+	for _, c := range cs {
+		addrs = append(addrs, c.Addr())
+	}
+	prod := client.NewProducer(addrs...)
 	last := time.Now()
 	for seq := 0; ctx.Err() == nil; {
 		vals := make([]string, batch)
 		for i := range vals {
 			vals[i] = fmt.Sprintf("m-%d", seq+i)
 		}
-		resp, err := produceRetry(ctx, cs, topic, part, vals)
+		resp, err := prod.Send(ctx, topic, part, vals, nil)
 		if err != nil {
 			return
 		}
@@ -482,7 +487,10 @@ func TestLeaderCrashUnderLoad(t *testing.T) {
 
 	got := consumeAll(t, c.client(newLeader), "orders", 0)
 	dups := verifyAcked(t, acks, got)
-	t.Logf("acked=%d in log=%d duplicates(from retries)=%d lost=0 max stall=%v", len(acks), len(got), dups, stall.Round(time.Millisecond))
+	t.Logf("acked=%d in log=%d duplicates=%d lost=0 max stall=%v", len(acks), len(got), dups, stall.Round(time.Millisecond))
+	if dups != 0 {
+		t.Fatalf("%d duplicates despite the idempotent producer", dups)
+	}
 
 	// The crashed broker comes back as a follower and converges to the same log.
 	c.start(leader)

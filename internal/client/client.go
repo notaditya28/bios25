@@ -59,6 +59,14 @@ func (c *Client) Produce(ctx context.Context, topic string, recs []api.ProduceRe
 	return out, c.do(ctx, http.MethodPost, "/v1/topics/"+url.PathEscape(topic)+"/records", api.ProduceRequest{Records: recs}, &out)
 }
 
+// ProduceRequest sends a full produce request (e.g. an idempotent batch).
+func (c *Client) ProduceRequest(ctx context.Context, topic string, req api.ProduceRequest) (api.ProduceResponse, error) {
+	var out api.ProduceResponse
+	return out, c.do(ctx, http.MethodPost, "/v1/topics/"+url.PathEscape(topic)+"/records", req, &out)
+}
+
+func (c *Client) Addr() string { return strings.TrimPrefix(c.base, "http://") }
+
 func (c *Client) Fetch(ctx context.Context, req api.FetchRequest) (api.FetchResponse, error) {
 	q := url.Values{}
 	q.Set("offset", strconv.FormatUint(req.Offset, 10))

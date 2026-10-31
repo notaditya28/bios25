@@ -700,6 +700,27 @@ func (b *Broker) Produce(ctx context.Context, req api.ProduceRequest) (api.Produ
 		return api.ProduceResponse{}, api.Errorf(api.CodeInvalidRequest, "a produce request needs 1..%d records", api.MaxProduceRecords)
 	}
 	n := len(t.Partitions)
+	if req.ProducerID != 0 {
+		// Idempotent batches target exactly one explicit partition (sequence numbers are per partition).
+		p := req.Records[0].Partition
+		for _, r := range req.Records {
+			if r.Partition == nil || p == nil || *r.Partition != *p {
+				return api.ProduceResponse{}, api.Errorf(api.CodeInvalidRequest, "an idempotent batch must set the same explicit partition on every record")
+			}
+		}
+		if *p < 0 || *p >= n {
+			return api.ProduceResponse{}, api.Errorf(api.CodeUnknownPartition, "topic %q has no partition %d", req.Topic, *p)
+		}
+		base, err := b.producePartition(ctx, t, *p, req.Records, req.ProducerID, req.BaseSeq, 0)
+		if err != nil {
+			return api.ProduceResponse{}, err
+		}
+		resp := api.ProduceResponse{Offsets: make([]api.RecordOffset, len(req.Records))}
+		for i := range resp.Offsets {
+			resp.Offsets[i] = api.RecordOffset{Partition: *p, Offset: base + uint64(i)}
+		}
+		return resp, nil
+	}
 	sticky := b.sticky(req.Topic, n)
 	groups := map[int][]int{}
 	var order []int
@@ -736,7 +757,7 @@ func (b *Broker) Produce(ctx context.Context, req api.ProduceRequest) (api.Produ
 			for j, i := range idx {
 				recs[j] = req.Records[i]
 			}
-			base, err := b.producePartition(ctx, t, p, recs, 0)
+			base, err := b.producePartition(ctx, t, p, recs, 0, 0, 0)
 			if err != nil {
 				errs[gi] = err
 				return
@@ -757,33 +778,35 @@ func (b *Broker) Produce(ctx context.Context, req api.ProduceRequest) (api.Produ
 }
 
 type partitionProduce struct {
-	Topic     string              `json:"topic"`
-	Partition int                 `json:"partition"`
-	Records   []api.ProduceRecord `json:"records"`
-	Hops      int                 `json:"hops"`
+	Topic      string              `json:"topic"`
+	Partition  int                 `json:"partition"`
+	Records    []api.ProduceRecord `json:"records"`
+	ProducerID uint64              `json:"producer_id,omitempty"`
+	BaseSeq    uint64              `json:"base_seq,omitempty"`
+	Hops       int                 `json:"hops"`
 }
 
 type partitionProduceResp struct {
 	Base uint64 `json:"base"`
 }
 
-func (b *Broker) producePartition(ctx context.Context, t *meta.TopicMeta, part int, recs []api.ProduceRecord, hops int) (uint64, error) {
+func (b *Broker) producePartition(ctx context.Context, t *meta.TopicMeta, part int, recs []api.ProduceRecord, pid, seq uint64, hops int) (uint64, error) {
 	local, cands, err := b.targets(t, part, hops)
 	if err != nil {
 		return 0, err
 	}
 	if local {
-		return b.produceLocal(ctx, t.Config.Name, part, recs)
+		return b.produceLocal(ctx, t.Config.Name, part, recs, pid, seq)
 	}
 	var out partitionProduceResp
-	in := partitionProduce{t.Config.Name, part, recs, hops + 1}
+	in := partitionProduce{t.Config.Name, part, recs, pid, seq, hops + 1}
 	if err := b.forward(ctx, t, cands, pathProduce, b.cfg.Replica.ProduceTimeout+2*b.cfg.Replica.RPCTimeout, in, &out); err != nil {
 		return 0, err
 	}
 	return out.Base, nil
 }
 
-func (b *Broker) produceLocal(ctx context.Context, topic string, part int, recs []api.ProduceRecord) (uint64, error) {
+func (b *Broker) produceLocal(ctx context.Context, topic string, part int, recs []api.ProduceRecord, pid, seq uint64) (uint64, error) {
 	p := b.parts.Get(meta.PartKey{Topic: topic, Partition: part})
 	if p == nil {
 		return 0, api.Errorf(api.CodeNotLeader, "%s has no replica of %s/%d", b.cfg.Info.ID, topic, part)
@@ -795,7 +818,7 @@ func (b *Broker) produceLocal(ctx context.Context, topic string, part int, recs 
 		}
 		lrecs[i].Value = []byte(r.Value)
 	}
-	return p.Produce(ctx, lrecs)
+	return p.Produce(ctx, lrecs, pid, seq)
 }
 
 func (b *Broker) handleProduce(ctx context.Context, req *partitionProduce) (*partitionProduceResp, error) {
@@ -806,7 +829,7 @@ func (b *Broker) handleProduce(ctx context.Context, req *partitionProduce) (*par
 	if req.Partition < 0 || req.Partition >= len(t.Partitions) {
 		return nil, api.Errorf(api.CodeUnknownPartition, "topic %q has no partition %d", req.Topic, req.Partition)
 	}
-	base, err := b.producePartition(ctx, t, req.Partition, req.Records, req.Hops)
+	base, err := b.producePartition(ctx, t, req.Partition, req.Records, req.ProducerID, req.BaseSeq, req.Hops)
 	if err != nil {
 		return nil, err
 	}

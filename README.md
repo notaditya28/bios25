@@ -9,7 +9,7 @@ routes around slow links, and a regional outage never freezes the surviving regi
 - [x] Milestone 2 — in-region replication (3 zones, 2-of-3 acks, lease-elected controller, epoch-fenced leader failover)
 - [x] Milestone 3 — residency enforcement at every data path + signed manifests + `residency_audit`
 - [x] Milestone 4 — independent regions; global topics with cross-region quorum and self-elected leaders; latency-aware relay routing
-- [ ] Milestone 5 — chaos harness + correctness checker
+- [x] Milestone 5 — idempotent producer; `hydra-chaos` harness + correctness checker (all 6 scenarios PASS)
 - [ ] Milestone 6 — dashboard
 
 ## Quick start (Windows PowerShell; Go 1.27+)
@@ -59,6 +59,16 @@ Invoke-RestMethod -Method Post http://127.0.0.1:9101/admin/v1/net -ContentType a
 .\scripts\hydra.ps1 kill -Region IN                                                            # whole region down
 ```
 
+Chaos harness — starts all 9 brokers itself, runs every scenario under load, verifies every
+acknowledged message and the residency audit, prints the results table (≈2 minutes):
+```powershell
+go build -o bin/ ./cmd/...
+.\bin\hydra-chaos.exe                                  # all scenarios; exit code 1 if any fails
+.\bin\hydra-chaos.exe -only kill-region,isolate-region # a subset
+```
+Results also land in `results/chaos-<time>.md` and `.json`. Latest run: see NOTES.md
+("Chaos results") — 0 lost, 0 duplicates, 0 order violations in all 6 scenarios.
+
 Raw HTTP works too:
 ```powershell
 curl.exe -s -X POST localhost:9101/v1/topics/orders/records -d '{\"records\":[{\"key\":\"u1\",\"value\":\"hello\"}]}'
@@ -82,6 +92,9 @@ internal/layout         on-disk layout of a broker data directory + scanner
 internal/manifest       signed (Ed25519) per-broker segment manifests
 internal/audit          residency audit rules and compliance report
 cmd/residency_audit     audit CLI (exit 1 on violations)
+cmd/hydra-chaos         chaos harness: real processes, faults, load, checker, results table
+internal/chaos          process control, fault injection, load streams, verification, report
+internal/client         also: idempotent Producer (producer id + sequence, retry without duplicates)
 scripts/hydra.ps1       start / stop / kill / restart brokers as local processes
 internal/transport/httpapi  HTTP/JSON adapter for api.Service
 internal/client         Go client used by the CLI, tests and (later) the load generator

@@ -231,16 +231,44 @@ controller lost its lease and creating a topic in that region timed out for 10 s
 reproduced since; the create forward now has a timeout and errors are reported. Watch for it
 in chaos runs.
 
+## Idempotent producer + chaos harness (Milestone 5)
+**Exactly-once writes per partition.** A producer has a random id; each batch for a partition
+carries `producer_id` + `base_seq`, and a failed batch is retried with the same numbers. Records
+store producer id + seq (and a batch-start flag), so every replica derives the same "last 8 batches
+per producer" table from its own log — after a failover the new leader recognises retries of
+batches the old leader wrote. A known batch is answered with its original offsets (after it is
+committed); a gap or an altered retry is refused. Bug caught by the test: the table first merged
+consecutive batches, so after failover a retry of the second batch looked "stale"; fixed with the
+batch-start flag.
+
+**`hydra-chaos`** starts the 9 brokers as real processes (fresh `data-chaos/`), creates one
+resident topic per region + a global topic, and for each scenario:
+1. runs 6 paced streams (≈12k msg/s total; batches of 20 every 10 ms) through idempotent
+   producers — one resident stream per region using that region's brokers, one stream per global
+   partition that prefers its home region but may use any broker — plus cross-region probes
+   that ask other regions for each resident topic every 250 ms;
+2. warm-up 3 s → audit → **fault** → audit mid-fault → hold 6 s → **heal** → wait until every
+   stream is acknowledged again → 2 s more → stop;
+3. reads every partition back and checks each acknowledged message is at its acked offset (loss),
+   appears once (duplicates) and in sequence (order); runs the residency audit again.
+
+Scenarios: `baseline`, `kill-broker` (leader of IN's resident partition), `kill-zone` (the zone
+hosting IN's controller), `kill-region` (all of IN), `isolate-region` (IN cut off both ways),
+`slow-link` (+150 ms each way between the global leader's region and another).
+
+Pass criteria (definition of done): 0 lost, 0 duplicates, 0 order violations; surviving traffic
+stalls < 1 s; explicit cross-region errors < 500 ms; no request hangs > 2.5 s; audit PASS before,
+during and after; slow-link must reroute.
+
+Tuning found by the harness: global partitions' election timeout lowered from 600 ms to 400 ms
+(+ up to 50% jitter). At 600 ms, global stalls in kill-zone/kill-region were 950–980 ms (just under
+target); at 400 ms they are 740–780 ms with no spurious elections in 3 full runs.
+
 ## Competitive extras (priority order; feature freeze at hour 20)
-1. **Correctness checker** (top priority) — runs alongside chaos tests, records every acknowledged
-   message (topic, partition, offset, unique message id) and verifies: no loss of acked messages,
-   per-partition ordering, no duplicates, no residency violations. Prints a results table per scenario.
-   Duplicates from client retries will be prevented with an idempotent producer
-   (producer id + sequence number per partition, deduplicated by the leader). **Not built yet** —
-   Milestone 2 tests show retries after an ambiguous error create 0–100 duplicates per failover.
-   Planned alongside the checker (Milestone 5) since the load generator is its main user.
-3. **Network partition tests** (top priority) — region alive but isolated, with epoch fencing visible
-   in broker logs (`fenced stale epoch=… current=…`).
+1. **Correctness checker** — **done in Milestone 5** (`hydra-chaos`), with the idempotent producer.
+3. **Network partition tests** — **done**: `isolate-region` chaos scenario + Go tests for an
+   isolated leader (in-region) and an isolated region (global); fencing visible in logs
+   (`fenced stale leader`, `stepping down`, `lost contact with a majority of regions`).
 2. Naive baseline mode — a single global controller, implemented as another `Coordinator`
    so the same chaos run can compare stall time and loss side by side.
 4. Signed segment manifests — **done in Milestone 3** (see Residency enforcement).
@@ -273,11 +301,34 @@ in chaos runs.
 | 4 | tests ×5: region isolation | resident writes inside isolated region 1–2 ms; global writes there fail in ~1–2 ms (`region_isolated`); majority re-elects (epoch 1→2); converges after heal, unacked writes dropped |
 | 4 | tests ×5: slow link | reroute decided 135–180 ms after the delay starts (≈3 probes) |
 
+| 5 | `hydra-chaos`, all 6 scenarios, real processes (see table below) | all PASS; 0 lost / 0 dups / 0 order violations over ~900k acked messages |
+
+### Chaos results (Milestone 5, `results/chaos-20261031-162802.md`)
+| Scenario | Acked | Lost | Dups | Order | Max stall surviving | Max stall global | Max stall affected | msg/s | Slowest error | Slowest probe | Audit b/d/a |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| baseline | 148,500 | 0 | 0 | 0 | 38 ms | 22 ms | – | 12,000 | – | 5.8 ms | PASS/PASS/PASS |
+| kill-broker | 148,780 | 0 | 0 | 0 | 44 ms | 777 ms | 553 ms | 11,782 | 34 ms | 6.2 ms | PASS/PASS/PASS |
+| kill-zone | 149,780 | 0 | 0 | 0 | 12 ms | 737 ms | 17 ms | 11,893 | 13 ms | 3.0 ms | PASS/PASS/PASS |
+| kill-region | 148,120 | 0 | 0 | 0 | 15 ms | 198 ms | 7,801 ms* | 10,835 | 46 ms | 5.2 ms | PASS/PASS/PASS |
+| isolate-region | 151,120 | 0 | 0 | 0 | 15 ms | 154 ms | – | 11,983 | 1.6 ms | 5.5 ms | PASS/PASS/PASS |
+| slow-link | 152,800 | 0 | 0 | 0 | 13 ms | 311 ms | – | 11,916 | – | 3.0 ms | PASS/PASS/PASS |
+
+\* By design: IN-resident data legally can't fail over to another region, so its stream waits
+for IN to come back (6 s fault + restart). Its clients got fast errors the whole time (slowest 46 ms),
+and other regions answered `REGION_UNAVAILABLE` for it within milliseconds. In `isolate-region` the
+IN resident stream kept flowing inside IN (counted under "surviving": 15 ms max stall).
+"Max stall global" is per global partition from a client's view; across runs it was 200–980 ms
+(kill-zone/kill-region, depending on whether the killed broker led a global partition).
+Slow-link: EU↔IN direct RTT measured 301 ms; EU-led global traffic from IN went via us-3;
+fetch p50 1.1 ms before vs 1.4 ms during the fault.
+
 ## Known limitations
 - In-memory index (see above). No retention, compaction, consumer groups or auth.
 - Consumers read by explicit offset; no committed consumer offsets (yet).
 - Produce across multiple partitions in one request is not atomic (each partition's slice is).
-- No idempotent producer yet: a retry after an ambiguous error can duplicate a batch.
+- Idempotence needs the client to use producer id + sequence numbers (the Go `client.Producer`
+  and the chaos load do); plain produce requests (curl, CLI) can still duplicate on retry.
+  The leader remembers the last 8 batches per producer per partition.
 - The high watermark isn't persisted: after a restart a replica may truncate (and re-copy)
   more than strictly necessary. Safe, just extra work.
 - Each metadata change ships the whole metadata snapshot (fine for tens of topics).

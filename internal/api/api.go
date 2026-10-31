@@ -60,6 +60,11 @@ type ProduceRecord struct {
 type ProduceRequest struct {
 	Topic   string          `json:"-"`
 	Records []ProduceRecord `json:"records"`
+	// Idempotent produce: all records go to one explicit partition; the batch's records get
+	// sequence numbers BaseSeq, BaseSeq+1, ... A retry must resend the same batch with the same
+	// numbers; the broker then returns the original offsets instead of writing it twice.
+	ProducerID uint64 `json:"producer_id,omitempty"`
+	BaseSeq    uint64 `json:"base_seq,omitempty"`
 }
 
 type RecordOffset struct {
