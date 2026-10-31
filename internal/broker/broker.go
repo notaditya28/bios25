@@ -110,13 +110,18 @@ func Open(cfg Config) (*Broker, error) {
 	if cfg.Net == nil {
 		cfg.Net = rpc.NewNet()
 	}
+	// Own copy: the caller's map may be shared (e.g. by several brokers in one test process).
+	dir := map[string]api.Info{}
 	if cfg.Directory == nil {
-		cfg.Directory = map[string]api.Info{}
 		for id := range cfg.Peers {
-			cfg.Directory[id] = api.Info{ID: id, Region: cfg.Info.Region}
+			dir[id] = api.Info{ID: id, Region: cfg.Info.Region}
 		}
 	}
-	cfg.Directory[cfg.Info.ID] = cfg.Info
+	for id, info := range cfg.Directory {
+		dir[id] = info
+	}
+	dir[cfg.Info.ID] = cfg.Info
+	cfg.Directory = dir
 	if err := os.MkdirAll(filepath.Join(cfg.DataDir, layout.TopicsDir), 0o755); err != nil {
 		return nil, err
 	}
@@ -438,9 +443,9 @@ func (b *Broker) handleCreate(ctx context.Context, cfg *api.TopicConfig) (*struc
 	if err != nil {
 		return nil, err
 	}
-	if err := b.checkRegion(n); err != nil {
-		return nil, err
-	}
+	// The forwarding broker already checked the topic belongs in this region. The controller's
+	// own region doesn't matter (it only writes metadata); placement below only picks brokers
+	// whose configured region satisfies the residency, and refuses if there are none.
 	_, err = b.createAsController(ctx, n)
 	return &struct{}{}, err
 }

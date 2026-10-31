@@ -219,11 +219,22 @@ func (c *cluster) controller() int {
 func (c *cluster) createTopic(cfg api.TopicConfig) {
 	c.t.Helper()
 	c.controller()
-	var err error
-	waitFor(c.t, 5*time.Second, "topic creation", func() bool {
-		_, err = c.client(0).CreateTopic(bg, cfg)
-		return err == nil
-	})
+	start := time.Now()
+	var errs []string
+	for {
+		_, err := c.client(0).CreateTopic(bg, cfg)
+		if err == nil {
+			if time.Since(start) > time.Second {
+				c.t.Logf("SLOW create %s took %v; errors on the way: %v", cfg.Name, time.Since(start).Round(time.Millisecond), errs)
+			}
+			return
+		}
+		errs = append(errs, fmt.Sprintf("%.1fs %v", time.Since(start).Seconds(), err))
+		if time.Since(start) > 10*time.Second {
+			c.t.Fatalf("create %s: %v", cfg.Name, errs)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // leaderOf returns the index of the broker that currently acts as leader of the partition.
@@ -517,9 +528,13 @@ func TestControllerCrash(t *testing.T) {
 	if _, err := cl.Topic(bg, "orders"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cl.CreateTopic(bg, api.TopicConfig{Name: "audit", Partitions: 1, Residency: "global"}); err != nil {
-		t.Fatal(err)
-	}
+	// Like any client, retry: right after an election the region may briefly answer
+	// REGION_UNAVAILABLE (fast, explicit) until the new controller has committed its first write.
+	var err error
+	waitFor(t, 5*time.Second, "create after controller change", func() bool {
+		_, err = cl.CreateTopic(bg, api.TopicConfig{Name: "audit", Partitions: 1, Residency: "global"})
+		return err == nil
+	})
 	// Every partition (including those led by the dead controller) is writable again.
 	for part := 0; part < 3; part++ {
 		ctx, cancel := context.WithTimeout(bg, 5*time.Second)

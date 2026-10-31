@@ -113,10 +113,14 @@ func TestGlobalTopicSpansRegions(t *testing.T) {
 
 	// Every region knows the global topic; each partition has one replica per region.
 	eu, us := c.byRegion("EU")[0], c.byRegion("US")[0]
-	info, err := c.client(us).Topic(bg, "prices")
-	if err != nil {
-		t.Fatalf("US doesn't know the global topic: %v", err)
-	}
+	// Creation succeeds at a majority of regions; a region that was busy (e.g. changing its
+	// controller) gets the topic from the background sync shortly after.
+	var info api.TopicInfo
+	var err error
+	waitFor(t, 5*time.Second, "US to learn the global topic", func() bool {
+		info, err = c.client(us).Topic(bg, "prices")
+		return err == nil
+	})
 	for _, p := range info.PartitionStates {
 		var rs []string
 		for _, r := range p.Replicas {

@@ -460,7 +460,15 @@ func (l *Lease) campaign(ctx context.Context) {
 	slog.Info("became controller", "epoch", epoch, "grants", grants)
 
 	// Commit the metadata our quorum had accepted under our own epoch before acting on it.
-	if _, err := l.Propose(ctx, func(*meta.Metadata) error { return nil }); err != nil {
+	// A slow peer (e.g. a busy disk) can time out once; retry while our lease is valid.
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		if _, err = l.Propose(ctx, func(*meta.Metadata) error { return nil }); err == nil || errors.Is(err, ErrNotController) {
+			break
+		}
+		time.Sleep(l.cfg.Timing.RenewInterval / 2)
+	}
+	if err != nil {
 		l.mu.Lock()
 		l.stepDownLocked("initial commit failed: " + err.Error())
 		l.mu.Unlock()
