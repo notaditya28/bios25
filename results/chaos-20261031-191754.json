@@ -1,0 +1,188 @@
+[
+  {
+    "scenario": "baseline",
+    "description": "no fault",
+    "acked": 148320,
+    "lost": 0,
+    "duplicates": 0,
+    "order_violations": 0,
+    "in_log_not_acked": 0,
+    "stall_surviving_ns": 13421500,
+    "stall_global_ns": 13932600,
+    "stall_affected_ns": 0,
+    "throughput_msgs_per_s": 12002.614647244152,
+    "failed_attempts": 0,
+    "max_error_latency_ns": 0,
+    "error_codes": {},
+    "probe_max_ns": 2368000,
+    "probe_codes": {
+      "WRONG_REGION": 150
+    },
+    "audit_before": "PASS",
+    "audit_during": "PASS",
+    "audit_after": "PASS",
+    "notes": [
+      "all streams acknowledged again 100ms after the heal"
+    ],
+    "pass": true,
+    "failures": null
+  },
+  {
+    "scenario": "kill-broker",
+    "description": "kill the leader of the faulted region's resident partition",
+    "acked": 147960,
+    "lost": 0,
+    "duplicates": 0,
+    "order_violations": 0,
+    "in_log_not_acked": 60,
+    "stall_surviving_ns": 30598000,
+    "stall_global_ns": 576261300,
+    "stall_affected_ns": 568864800,
+    "throughput_msgs_per_s": 11824.974457943283,
+    "failed_attempts": 11,
+    "max_error_latency_ns": 50624700,
+    "error_codes": {
+      "NOT_ENOUGH_REPLICAS/electing_leader": 1,
+      "NOT_LEADER/leader_unreachable": 7,
+      "TRANSPORT": 3
+    },
+    "probe_max_ns": 3397300,
+    "probe_codes": {
+      "WRONG_REGION": 153
+    },
+    "audit_before": "PASS",
+    "audit_during": "PASS",
+    "audit_after": "PASS",
+    "notes": [
+      "killed in-2 (leader of in-orders/0)",
+      "all streams acknowledged again 101ms after the heal"
+    ],
+    "pass": true,
+    "failures": null
+  },
+  {
+    "scenario": "kill-zone",
+    "description": "kill the zone hosting the faulted region's controller",
+    "acked": 152280,
+    "lost": 0,
+    "duplicates": 0,
+    "order_violations": 0,
+    "in_log_not_acked": 120,
+    "stall_surviving_ns": 13249000,
+    "stall_global_ns": 14446800,
+    "stall_affected_ns": 15606500,
+    "throughput_msgs_per_s": 11998.266917000878,
+    "failed_attempts": 0,
+    "max_error_latency_ns": 0,
+    "error_codes": {},
+    "probe_max_ns": 3217600,
+    "probe_codes": {
+      "WRONG_REGION": 153
+    },
+    "audit_before": "PASS",
+    "audit_during": "PASS",
+    "audit_after": "PASS",
+    "notes": [
+      "killed zone in-c (broker in-3, the IN controller)",
+      "all streams acknowledged again 100ms after the heal"
+    ],
+    "pass": true,
+    "failures": null
+  },
+  {
+    "scenario": "kill-region",
+    "description": "kill every broker of the faulted region",
+    "acked": 148040,
+    "lost": 0,
+    "duplicates": 0,
+    "order_violations": 0,
+    "in_log_not_acked": 0,
+    "stall_surviving_ns": 15066000,
+    "stall_global_ns": 214163800,
+    "stall_affected_ns": 8013657500,
+    "throughput_msgs_per_s": 10807.099586977387,
+    "failed_attempts": 45,
+    "max_error_latency_ns": 61449200,
+    "error_codes": {
+      "NOT_LEADER": 6,
+      "TRANSPORT": 39
+    },
+    "probe_max_ns": 3810200,
+    "probe_codes": {
+      "REGION_UNAVAILABLE": 25,
+      "WRONG_REGION": 140
+    },
+    "audit_before": "PASS",
+    "audit_during": "PASS",
+    "audit_after": "PASS",
+    "notes": [
+      "killed all of IN",
+      "all streams acknowledged again 1.406s after the heal"
+    ],
+    "pass": true,
+    "failures": null
+  },
+  {
+    "scenario": "isolate-region",
+    "description": "faulted region alive but cut off from the other regions",
+    "acked": 158620,
+    "lost": 0,
+    "duplicates": 0,
+    "order_violations": 0,
+    "in_log_not_acked": 0,
+    "stall_surviving_ns": 14141300,
+    "stall_global_ns": 157618400,
+    "stall_affected_ns": 0,
+    "throughput_msgs_per_s": 11984.578683579484,
+    "failed_attempts": 3,
+    "max_error_latency_ns": 3951800,
+    "error_codes": {
+      "NOT_LEADER/leader_unreachable": 3
+    },
+    "probe_max_ns": 2892500,
+    "probe_codes": {
+      "REGION_UNAVAILABLE": 75,
+      "WRONG_REGION": 84
+    },
+    "audit_before": "PASS",
+    "audit_during": "PASS",
+    "audit_after": "PASS",
+    "notes": [
+      "isolated IN (both directions)",
+      "all streams acknowledged again 100ms after the heal"
+    ],
+    "pass": true,
+    "failures": null
+  },
+  {
+    "scenario": "slow-link",
+    "description": "add 150 ms each way on the link between the global leader's region and another",
+    "acked": 158200,
+    "lost": 0,
+    "duplicates": 0,
+    "order_violations": 0,
+    "in_log_not_acked": 0,
+    "stall_surviving_ns": 13740500,
+    "stall_global_ns": 310650400,
+    "stall_affected_ns": 0,
+    "throughput_msgs_per_s": 11916.660630498915,
+    "failed_attempts": 0,
+    "max_error_latency_ns": 0,
+    "error_codes": {},
+    "probe_max_ns": 4012600,
+    "probe_codes": {
+      "WRONG_REGION": 162
+    },
+    "audit_before": "PASS",
+    "audit_during": "PASS",
+    "audit_after": "PASS",
+    "notes": [
+      "slowed EU\u003c-\u003eIN by 150 ms each way; observing prices/0 (leader eu-1) from in-1",
+      "during the fault in-1 reached eu-1 via \"us-2\" (direct RTT measured 301 ms)",
+      "prices/0 fetch p50 from 127.0.0.1:9101: 1.1ms before the fault, 1.6ms in the second half of it",
+      "all streams acknowledged again 100ms after the heal"
+    ],
+    "pass": true,
+    "failures": null
+  }
+]
