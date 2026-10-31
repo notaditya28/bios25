@@ -445,8 +445,6 @@ func (b *Broker) handleCreate(ctx context.Context, cfg *api.TopicConfig) (*struc
 	return &struct{}{}, err
 }
 
-var errNoChange = errors.New("no change")
-
 func (b *Broker) createAsController(ctx context.Context, cfg api.TopicConfig) (*meta.Metadata, error) {
 	live := b.coord.Live()
 	quorum := len(b.peers)/2 + 1
@@ -493,13 +491,19 @@ func (b *Broker) createAsController(ctx context.Context, cfg api.TopicConfig) (*
 }
 
 func (b *Broker) proposeTopic(ctx context.Context, cfg api.TopicConfig, place func(p int) meta.PartitionMeta) (*meta.Metadata, error) {
+	// "Already exists" must be judged on *committed* metadata. The proposal base is the latest
+	// accepted version, which can hold a topic that a previous controller never committed (it
+	// lost its lease mid-proposal); in that case we still propose, which commits it.
+	if t, ok := b.coord.Committed().Topics[cfg.Name]; ok && t.Config == cfg {
+		return b.coord.Committed(), nil
+	}
 	md, err := b.coord.Propose(ctx, func(m *meta.Metadata) error {
 		if t, ok := m.Topics[cfg.Name]; ok {
 			if t.Config != cfg {
 				return api.Errorf(api.CodeTopicExists, "topic %q exists with partitions=%d residency=%s",
 					cfg.Name, t.Config.Partitions, t.Config.Residency)
 			}
-			return errNoChange
+			return nil // accepted but not yet committed: committing this version commits it
 		}
 		t := &meta.TopicMeta{Config: cfg}
 		for p := 0; p < cfg.Partitions; p++ {
@@ -508,9 +512,6 @@ func (b *Broker) proposeTopic(ctx context.Context, cfg api.TopicConfig, place fu
 		m.Topics[cfg.Name] = t
 		return nil
 	})
-	if errors.Is(err, errNoChange) {
-		return b.coord.Committed(), nil
-	}
 	if errors.Is(err, coord.ErrNotController) {
 		return nil, api.Errorf(api.CodeRegionUnavailable, "lost the controller lease")
 	}

@@ -226,10 +226,14 @@ live where from the probe gossip (topic name + residency + partition count; meta
   `delays_ms`), added on both request and response. (A separate TCP delay proxy is unnecessary
   for local runs; the effect on RTT is identical.)
 
-Known flake: once in ~40 runs of the multi-region tests under heavy CPU load, a region's
-controller lost its lease and creating a topic in that region timed out for 10 s. Not
-reproduced since; the create forward now has a timeout and errors are reported. Watch for it
-in chaos runs.
+Flake found and fixed (Milestone 6): under heavy CPU load a region's controller could change
+mid-way through a topic creation, leaving the topic in the region's *accepted* metadata but not
+its *committed* metadata. Creation checked "already exists?" against the accepted copy, so every
+retry became a no-op and the region reported `UNKNOWN_TOPIC` forever (the 10 s create timeouts
+seen twice). Now "exists" is judged on committed metadata, and an accepted-only topic is
+re-proposed, which commits it. Reproduced reliably by running the test suite while the
+dashboard's 9 brokers + load were busy; 4 × full broker suite passed after the fix under the
+same load.
 
 ## Idempotent producer + chaos harness (Milestone 5)
 **Exactly-once writes per partition.** A producer has a random id; each batch for a partition
