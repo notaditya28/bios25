@@ -53,15 +53,23 @@ function Start-Broker($b) {
 }
 
 switch ($Action) {
+    # Windows PowerShell treats a program's stderr (our log lines) as errors, so these run via
+    # Start-Process with stderr sent to a log file; stdout (results, URL) stays on the console.
     "demo" {
         go build -o bin/ ./cmd/...
         if ($LASTEXITCODE -ne 0) { exit 1 }
-        .\bin\hydra-dash.exe -config $Config
+        Write-Host "starting 9 brokers + load + dashboard (logs: hydra-dash.log). Ctrl+C stops everything."
+        $p = Start-Process -FilePath .\bin\hydra-dash.exe -ArgumentList "-config", $Config `
+            -NoNewWindow -PassThru -Wait -RedirectStandardError hydra-dash.log
+        exit $p.ExitCode
     }
     "chaos" {
         go build -o bin/ ./cmd/...
         if ($LASTEXITCODE -ne 0) { exit 1 }
-        .\bin\hydra-chaos.exe -config $Config
+        Write-Host "running every chaos scenario (about 2-3 minutes; progress log: hydra-chaos.log)..."
+        $p = Start-Process -FilePath .\bin\hydra-chaos.exe -ArgumentList "-config", $Config `
+            -NoNewWindow -PassThru -Wait -RedirectStandardError hydra-chaos.log
+        exit $p.ExitCode
     }
     "start" {
         go build -o bin/ ./cmd/...

@@ -101,7 +101,7 @@ input[type=number] { width: 80px; }
 .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
 /* map */
-#map svg { width: 100%; height: auto; display: block; }
+#map svg { width: 100%; max-width: 460px; height: auto; display: block; margin: 0 auto; }
 #map .edge { stroke: var(--text-muted); stroke-width: 2; }
 #map .edge.slow { stroke: var(--warning); stroke-width: 2.5; }
 #map .edge.blocked { stroke: var(--critical); stroke-dasharray: 6 6; }
