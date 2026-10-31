@@ -6,6 +6,11 @@
 // lowest clock goes next). The scheduler is work-conserving: capacity a class doesn't use flows
 // to the others. Control traffic (votes, heartbeats, metadata) is always served first.
 //
+// Small control and urgent sends (adaptive mode) may also overdraw the bucket: without that, a
+// 1 KB vote queued behind a 128 KB catch-up chunk waits for the chunk's whole debt to be repaid
+// (~50 ms at 20 Mbit/s). The overdraft has its own budget (5% of capacity), so a flood of small
+// "urgent" sends can't bypass the link limit.
+//
 // Modes:
 //
 //	adaptive (default) – an AIMD controller tunes the recovery class's weight from the smoothed
@@ -60,6 +65,8 @@ const (
 	wRecoveryMin = 0.25 // recovery never gets less than ~5% of a saturated link
 	wRecoveryMax = 6.0
 	burstSeconds = 0.02
+	smallSend    = 4 << 10 // control/urgent sends up to this size may use the overdraft
+	overdraftPct = 0.05    // overdraft refill rate, share of capacity
 	tick         = 100 * time.Millisecond
 	keepSamples  = 2048
 )
@@ -99,6 +106,7 @@ type Link struct {
 	tokens    float64
 	last      time.Time
 	recTokens float64 // fixed mode: recovery's own bucket
+	odTokens  float64 // adaptive mode: overdraft budget for small control/urgent sends
 	queues    [route.NumClasses][]*waiter
 	fifo      []*waiter
 	pass      [route.NumClasses]float64
@@ -274,6 +282,9 @@ func (l *Link) dispatch() {
 			if l.cfg.Mode == Fixed {
 				l.recTokens = math.Min(burst*l.cfg.FixedRecoveryShare, l.recTokens+el*l.capacity*l.cfg.FixedRecoveryShare)
 			}
+			if l.cfg.Mode == Adaptive {
+				l.odTokens = math.Min(math.Max(smallSend, burst*overdraftPct), l.odTokens+el*l.capacity*overdraftPct)
+			}
 		}
 		l.last = now
 		var wait time.Duration = -1
@@ -286,6 +297,19 @@ func (l *Link) dispatch() {
 			l.tokens -= w.bytes
 			l.recordLocked(w.class, w.bytes, now.Sub(w.enq).Seconds()+w.bytes/l.capacity)
 			close(w.ready)
+		}
+		if l.capacity > 0 && l.cfg.Mode == Adaptive {
+			for _, c := range []route.Class{route.Control, route.Urgent} {
+				for len(l.queues[c]) > 0 && l.queues[c][0].bytes <= smallSend && l.odTokens >= l.queues[c][0].bytes {
+					w := l.queues[c][0]
+					l.queues[c] = l.queues[c][1:]
+					l.pass[c] += w.bytes / l.weights[c]
+					l.tokens -= w.bytes // still counted against the link: everyone repays it
+					l.odTokens -= w.bytes
+					l.recordLocked(w.class, w.bytes, now.Sub(w.enq).Seconds()+w.bytes/l.capacity)
+					close(w.ready)
+				}
+			}
 		}
 		if l.capacity > 0 && l.pendingLocked() {
 			need := -l.tokens

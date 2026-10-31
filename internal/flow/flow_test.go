@@ -75,3 +75,32 @@ func TestUnlimitedLinkNeverWaits(t *testing.T) {
 		t.Fatalf("unlimited link throttled: %v", time.Since(start))
 	}
 }
+
+// A small urgent send must not wait for a large catch-up chunk's debt to be repaid.
+func TestUrgentOverdraftUnderBacklog(t *testing.T) {
+	l := NewLink(Config{})
+	defer l.Close()
+	l.SetCapacity(2.4e6)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for range 4 {
+		go func() {
+			for ctx.Err() == nil {
+				_ = l.Acquire(ctx, route.Recovery, 128<<10)
+			}
+		}()
+	}
+	time.Sleep(200 * time.Millisecond)
+	var worst time.Duration
+	for range 20 {
+		t0 := time.Now()
+		if err := l.Acquire(ctx, route.Urgent, 1024); err != nil {
+			t.Fatal(err)
+		}
+		worst = max(worst, time.Since(t0))
+		time.Sleep(20 * time.Millisecond)
+	}
+	if worst > 15*time.Millisecond {
+		t.Fatalf("urgent send waited %v behind recovery debt", worst)
+	}
+}
