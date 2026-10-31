@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"flag"
 	"log/slog"
@@ -16,6 +17,8 @@ import (
 	"github.com/notaditya28/hydra-stream/internal/api"
 	"github.com/notaditya28/hydra-stream/internal/broker"
 	"github.com/notaditya28/hydra-stream/internal/config"
+	"github.com/notaditya28/hydra-stream/internal/flow"
+	"github.com/notaditya28/hydra-stream/internal/policy"
 	"github.com/notaditya28/hydra-stream/internal/seglog"
 )
 
@@ -25,18 +28,36 @@ func main() {
 	dataRoot := flag.String("data", "data", "data root; this broker uses <data>/<id>")
 	segBytes := flag.Int64("segment-bytes", seglog.DefaultSegmentBytes, "roll segments at this size")
 	fsync := flag.Bool("fsync", false, "fsync every append")
+	flowMode := flag.String("flow", "adaptive", "inter-region bandwidth scheduling: adaptive | fifo | fixed")
+	diskMB := flag.Int64("disk-budget-mb", 10240, "storage budget for time-to-full forecasts")
+	noDedup := flag.Bool("no-dedup", false, "disable wire-level payload dedup for cross-region replication")
 	flag.Parse()
 
-	if err := run(*cfgPath, *id, *dataRoot, seglog.Config{SegmentBytes: *segBytes, Fsync: *fsync}); err != nil {
+	opts := options{flow: flow.Config{Mode: flow.Mode(*flowMode)}, diskBudget: *diskMB << 20, noDedup: *noDedup}
+	if err := run(*cfgPath, *id, *dataRoot, seglog.Config{SegmentBytes: *segBytes, Fsync: *fsync}, opts); err != nil {
 		slog.Error("broker failed", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(cfgPath, id, dataRoot string, logCfg seglog.Config) error {
+type options struct {
+	flow       flow.Config
+	diskBudget int64
+	noDedup    bool
+}
+
+func run(cfgPath, id, dataRoot string, logCfg seglog.Config, opts options) error {
 	cluster, err := config.Load(cfgPath)
 	if err != nil {
 		return err
+	}
+	var policyKey ed25519.PublicKey
+	if p := cluster.PolicyKeyPath(); p != "" {
+		if k, err := policy.LoadPublicKey(p); err == nil {
+			policyKey = k
+		} else {
+			slog.Warn("no policy public key: only built-in residency rules will work", "file", p, "err", err)
+		}
 	}
 	bc, region, ok := cluster.Find(id)
 	if !ok {
@@ -56,13 +77,17 @@ func run(cfgPath, id, dataRoot string, logCfg seglog.Config) error {
 		}
 	}
 	b, err := broker.Open(broker.Config{
-		Info:      api.Info{ID: id, Region: region.Name, Zone: bc.Zone},
-		DataDir:   filepath.Join(dataRoot, id),
-		Regions:   cluster.RegionNames(),
-		Peers:     peers,
-		Directory: directory,
-		Addrs:     addrs,
-		Log:       logCfg,
+		Info:       api.Info{ID: id, Region: region.Name, Zone: bc.Zone},
+		DataDir:    filepath.Join(dataRoot, id),
+		Regions:    cluster.RegionNames(),
+		Peers:      peers,
+		Directory:  directory,
+		Addrs:      addrs,
+		Log:        logCfg,
+		PolicyKey:  policyKey,
+		Flow:       opts.flow,
+		DiskBudget: opts.diskBudget,
+		NoDedup:    opts.noDedup,
 	})
 	if err != nil {
 		return err

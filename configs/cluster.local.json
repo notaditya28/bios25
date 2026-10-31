@@ -1,4 +1,5 @@
 {
+  "policy_public_key_file": "policy-admin.pub",
   "regions": [
     {
       "name": "IN",

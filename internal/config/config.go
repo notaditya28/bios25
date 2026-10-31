@@ -7,12 +7,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
 
 type Cluster struct {
 	Regions []Region `json:"regions"`
+	// PolicyPublicKeyFile holds the administrator's Ed25519 public key (hex) that signs policy
+	// documents. Relative paths are relative to the config file.
+	PolicyPublicKeyFile string `json:"policy_public_key_file,omitempty"`
+
+	dir string
+}
+
+// PolicyKeyPath resolves PolicyPublicKeyFile ("" if unset).
+func (c *Cluster) PolicyKeyPath() string {
+	if c.PolicyPublicKeyFile == "" || filepath.IsAbs(c.PolicyPublicKeyFile) {
+		return c.PolicyPublicKeyFile
+	}
+	return filepath.Join(c.dir, c.PolicyPublicKeyFile)
 }
 
 type Region struct {
@@ -40,6 +54,7 @@ func Load(path string) (*Cluster, error) {
 	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
+	c.dir = filepath.Dir(path)
 	return &c, nil
 }
 

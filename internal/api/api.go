@@ -34,7 +34,8 @@ type Info struct {
 type TopicConfig struct {
 	Name       string `json:"name"`
 	Partitions int    `json:"partitions"`
-	Residency  string `json:"residency"` // "global" or a region name such as "IN"
+	Residency  string `json:"residency"`          // "global", a region name such as "IN", or "policy:<class>"
+	Priority   string `json:"priority,omitempty"` // "urgent": replication gets the urgent bandwidth class
 }
 
 type PartitionInfo struct {
@@ -65,15 +66,30 @@ type ProduceRequest struct {
 	// numbers; the broker then returns the original offsets instead of writing it twice.
 	ProducerID uint64 `json:"producer_id,omitempty"`
 	BaseSeq    uint64 `json:"base_seq,omitempty"`
+
+	// Class tags these messages with a stricter policy class. It can only NARROW the topic's
+	// policy (where they may be stored / pass through), never widen it.
+	Class string `json:"class,omitempty"`
+	// Acks is the durability required before the broker acknowledges:
+	//   "leader" - appended on the leader (fastest; lost if the leader dies before replicating)
+	//   "quorum" - on a majority of replicas (default)
+	//   "all"    - on every replica (for cross-region data: in every allowed region)
+	// A policy's min_acks raises it; a producer can't go below the policy floor.
+	Acks string `json:"acks,omitempty"`
+	// Via asks for cross-region forwarding through a specific region. It is honoured only if
+	// the data's policy permits transit there; otherwise the request is refused.
+	Via string `json:"via,omitempty"`
+}
+
+type ProduceResponse struct {
+	Offsets []RecordOffset `json:"offsets"`          // aligned with the request's records
+	Acks    string         `json:"acks,omitempty"`   // durability actually applied
+	Policy  string         `json:"policy,omitempty"` // policy (and version) the data was checked against
 }
 
 type RecordOffset struct {
 	Partition int    `json:"partition"`
 	Offset    uint64 `json:"offset"`
-}
-
-type ProduceResponse struct {
-	Offsets []RecordOffset `json:"offsets"` // aligned with the request's records
 }
 
 type FetchRequest struct {

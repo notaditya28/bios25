@@ -20,7 +20,10 @@ import (
 	"time"
 
 	"github.com/notaditya28/hydra-stream/internal/api"
+	"github.com/notaditya28/hydra-stream/internal/flow"
+	"github.com/notaditya28/hydra-stream/internal/policy"
 	"github.com/notaditya28/hydra-stream/internal/residency"
+	"github.com/notaditya28/hydra-stream/internal/route"
 	"github.com/notaditya28/hydra-stream/internal/rpc"
 )
 
@@ -38,6 +41,7 @@ type TopicSummary struct {
 	Name       string `json:"name"`
 	Residency  string `json:"residency"`
 	Partitions int    `json:"partitions"`
+	Priority   string `json:"priority,omitempty"`
 }
 
 type PingRequest struct {
@@ -56,7 +60,32 @@ type RelayRequest struct {
 	Path      string          `json:"path"`
 	Topic     string          `json:"topic"`
 	Residency string          `json:"residency"`
+	Classes   []string        `json:"classes,omitempty"` // per-message policy classes in the payload
 	Body      json.RawMessage `json:"body"`
+	Hops      int             `json:"hops"`
+	Visited   []string        `json:"visited"`
+	Class     route.Class     `json:"class"`
+}
+
+// NarrowFor resolves per-message classes into one combined (intersected) rule.
+func (r *Router) NarrowFor(classes []string) (*policy.Effective, error) {
+	if len(classes) == 0 {
+		return nil, nil
+	}
+	var out *policy.Effective
+	for _, c := range classes {
+		e, err := r.cfg.Guard.Engine().Class(c)
+		if err != nil {
+			return nil, err
+		}
+		if out == nil {
+			out = &e
+		} else {
+			n := out.Narrow(e)
+			out = &n
+		}
+	}
+	return out, nil
 }
 
 type Config struct {
@@ -66,6 +95,7 @@ type Config struct {
 	Guard     *residency.Guard
 	Interval  time.Duration         // probe interval
 	Topics    func() []TopicSummary // this broker's view of its region's topics
+	Flow      flow.Config           // inter-region bandwidth scheduling
 }
 
 type Router struct {
@@ -77,6 +107,7 @@ type Router struct {
 	tables map[string]map[string]float64 // their RTT tables
 	topics map[string][]TopicSummary     // by broker id
 	routes map[string]string             // destination -> relay broker ("" = direct)
+	links  map[string]*flow.Link         // destination region -> bandwidth scheduler
 
 	relayed atomic.Int64
 }
@@ -85,8 +116,63 @@ func New(cfg Config) *Router {
 	if cfg.Interval == 0 {
 		cfg.Interval = 200 * time.Millisecond
 	}
-	return &Router{cfg: cfg, rtt: map[string]float64{}, lastOK: map[string]time.Time{},
-		tables: map[string]map[string]float64{}, topics: map[string][]TopicSummary{}, routes: map[string]string{}}
+	r := &Router{cfg: cfg, rtt: map[string]float64{}, lastOK: map[string]time.Time{},
+		tables: map[string]map[string]float64{}, topics: map[string][]TopicSummary{}, routes: map[string]string{},
+		links: map[string]*flow.Link{}}
+	for _, id := range r.remote() {
+		region := cfg.Directory[id].Region
+		if r.links[region] == nil {
+			r.links[region] = flow.NewLink(cfg.Flow)
+		}
+	}
+	return r
+}
+
+// Close stops the link schedulers.
+func (r *Router) Close() {
+	for _, l := range r.links {
+		l.Close()
+	}
+}
+
+// SetLinkCapacity sets the capacity (bytes/s, 0 = unlimited) of our link towards region.
+func (r *Router) SetLinkCapacity(region string, bps float64) {
+	if l := r.links[region]; l != nil {
+		l.SetCapacity(bps)
+	}
+}
+
+// FlowStats reports each outgoing link's scheduler state.
+func (r *Router) FlowStats() map[string]flow.Stats {
+	out := map[string]flow.Stats{}
+	for region, l := range r.links {
+		out[region] = l.Stats()
+	}
+	return out
+}
+
+// shape waits until the link towards peer's region admits in (no-op on unlimited links and
+// inside our own region).
+func (r *Router) shape(ctx context.Context, peer string, class route.Class, in any) error {
+	l := r.links[r.cfg.Directory[peer].Region]
+	if l == nil || l.Capacity() <= 0 {
+		return nil
+	}
+	n := 256
+	if v, ok := in.(json.RawMessage); ok {
+		n = len(v)
+	} else if data, err := json.Marshal(in); err == nil {
+		n = len(data)
+	}
+	return l.Acquire(ctx, class, n)
+}
+
+// call shapes and sends one request.
+func (r *Router) call(ctx context.Context, to, path string, class route.Class, in, out any) error {
+	if err := r.shape(ctx, to, class, in); err != nil {
+		return err
+	}
+	return r.cfg.RPC.Call(ctx, to, path, in, out)
 }
 
 func (r *Router) Register(mux *http.ServeMux) {
@@ -190,13 +276,14 @@ func (r *Router) table() map[string]float64 {
 	return out
 }
 
-// bestRelayLocked returns the fastest relay broker towards to and its estimated round trip.
-func (r *Router) bestRelayLocked(to string) (string, float64) {
+// bestRelayLocked returns the fastest relay broker towards to (only through regions allowed
+// says yes to; nil = any) and its estimated round trip.
+func (r *Router) bestRelayLocked(to string, allowed func(region string) bool) (string, float64) {
 	toRegion := r.cfg.Directory[to].Region
 	best, cost := "", math.Inf(1)
 	for via, ms := range r.rtt {
 		vr := r.cfg.Directory[via].Region
-		if vr == toRegion || vr == r.cfg.Self.Region || !r.upLocked(via) {
+		if vr == toRegion || vr == r.cfg.Self.Region || !r.upLocked(via) || (allowed != nil && !allowed(vr)) {
 			continue
 		}
 		onward, ok := r.tables[via][to]
@@ -218,7 +305,7 @@ func (r *Router) recompute() {
 		if r.upLocked(to) {
 			direct = r.rtt[to]
 		}
-		via, cost := r.bestRelayLocked(to)
+		via, cost := r.bestRelayLocked(to, nil)
 		cur := r.routes[to]
 		next := ""
 		switch {
@@ -250,27 +337,81 @@ func round(f float64) float64 {
 	return math.Round(f*10) / 10
 }
 
-// Send delivers an internal request for topic (with residency res) to broker to, relaying
-// through a third region when that is faster. Resident data always goes direct.
-func (r *Router) Send(ctx context.Context, to, path, topic, res string, in, out any) error {
-	if res != api.ResidencyGlobal || r.cfg.Directory[to].Region == r.cfg.Self.Region {
+// chooseVia picks the relay for a send, honouring the payload's policy: only regions the data
+// may transit are candidates. A producer-requested relay region must itself be permitted.
+func (r *Router) chooseVia(to string, eff policy.Effective, want string) (string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if want != "" {
+		if !eff.CanTransit(want) {
+			e := api.Errorf(api.CodeResidencyViolation, "requested route via %s is not permitted for %s", want, eff.Name)
+			e.Reason = "route_not_permitted"
+			return "", e
+		}
+		best, bestRTT := "", math.Inf(1)
+		for _, id := range r.remote() {
+			if r.cfg.Directory[id].Region == want && r.upLocked(id) && r.rtt[id] < bestRTT {
+				best, bestRTT = id, r.rtt[id]
+			}
+		}
+		if want == r.cfg.Directory[to].Region || want == r.cfg.Self.Region {
+			return "", nil // "via" the source or destination region is just the direct path
+		}
+		if best == "" {
+			return "", api.Errorf(api.CodeRegionUnavailable, "requested relay region %s is unreachable", want)
+		}
+		return best, nil
+	}
+	cached := r.routes[to]
+	if cached == "" {
+		return "", nil // direct is best (or as good as anything)
+	}
+	if eff.CanTransit(r.cfg.Directory[cached].Region) {
+		return cached, nil
+	}
+	// The usual relay is forbidden for this data: is another permitted relay worth it?
+	direct := math.Inf(1)
+	if r.upLocked(to) {
+		direct = r.rtt[to]
+	}
+	via, cost := r.bestRelayLocked(to, eff.CanTransit)
+	if via != "" && (math.IsInf(direct, 1) || (cost < switchRatio*direct && direct-cost >= minGainMs)) {
+		return via, nil
+	}
+	return "", nil
+}
+
+// Send delivers an internal request to broker to, relaying through a third region when that
+// is faster and the data's policy allows it to transit there.
+func (r *Router) Send(ctx context.Context, to, path string, o route.Opts, in, out any) error {
+	if r.cfg.Directory[to].Region == r.cfg.Self.Region {
 		return r.cfg.RPC.Call(ctx, to, path, in, out)
 	}
-	r.mu.RLock()
-	via := r.routes[to]
-	r.mu.RUnlock()
+	eff, err := r.cfg.Guard.Policy(o.Residency)
+	if err != nil {
+		return err // fail closed
+	}
+	if o.Narrow != nil {
+		eff = eff.Narrow(*o.Narrow)
+	}
+	via, err := r.chooseVia(to, eff, o.Via)
+	if err != nil {
+		return err
+	}
 	if via == "" {
-		return r.cfg.RPC.Call(ctx, to, path, in, out)
+		return r.call(ctx, to, path, o.Class, in, out)
 	}
 	body, err := json.Marshal(in)
 	if err != nil {
 		return err
 	}
 	var raw json.RawMessage
-	err = r.cfg.RPC.Call(ctx, via, PathRelay, RelayRequest{To: to, Path: path, Topic: topic, Residency: res, Body: body}, &raw)
+	req := RelayRequest{To: to, Path: path, Topic: o.Topic, Residency: o.Residency, Classes: o.Classes,
+		Body: body, Hops: 1, Visited: []string{r.cfg.Self.ID}, Class: o.Class}
+	err = r.call(ctx, via, PathRelay, o.Class, req, &raw)
 	var ae *api.Error
-	if err != nil && !errors.As(err, &ae) && ctx.Err() == nil {
-		return r.cfg.RPC.Call(ctx, to, path, in, out) // relay unreachable: try direct
+	if err != nil && !errors.As(err, &ae) && ctx.Err() == nil && o.Via == "" {
+		return r.call(ctx, to, path, o.Class, in, out) // relay unreachable: try direct
 	}
 	if err != nil {
 		return err
@@ -281,15 +422,38 @@ func (r *Router) Send(ctx context.Context, to, path, topic, res string, in, out 
 	return json.Unmarshal(raw, out)
 }
 
+const maxRelayHops = 2
+
 func (r *Router) handleRelay(ctx context.Context, req *RelayRequest) (*json.RawMessage, error) {
-	if err := r.cfg.Guard.CheckPeer(req.Topic, req.Residency, r.cfg.Self.ID, "relay data through"); err != nil {
+	if req.Hops > maxRelayHops {
+		e := api.Errorf(api.CodeResidencyViolation, "relay hop limit exceeded (%d)", req.Hops)
+		e.Reason = "hop_limit"
+		return nil, e
+	}
+	for _, v := range req.Visited {
+		if v == r.cfg.Self.ID {
+			e := api.Errorf(api.CodeResidencyViolation, "routing loop through %s", v)
+			e.Reason = "routing_loop"
+			return nil, e
+		}
+	}
+	// Re-check with our own copy of the policy (the sender's choice is not trusted): we may
+	// carry the data, and the next hop may store it. Per-message classes narrow the rule.
+	narrow, err := r.NarrowFor(req.Classes)
+	if err != nil {
 		return nil, err
 	}
-	if err := r.cfg.Guard.CheckPeer(req.Topic, req.Residency, req.To, "relay to"); err != nil {
+	g := r.cfg.Guard
+	if err := g.Do(residency.Check{Topic: req.Topic, Partition: -1, Residency: req.Residency, Narrow: narrow,
+		Hop: "relay", Need: residency.Transit, Batch: req.Path}); err != nil {
+		return nil, err
+	}
+	if err := g.Do(residency.Check{Topic: req.Topic, Partition: -1, Residency: req.Residency, Narrow: narrow,
+		Hop: "relay-to", Peer: req.To, Need: residency.Store, Quiet: true}); err != nil {
 		return nil, err
 	}
 	var raw json.RawMessage
-	if err := r.cfg.RPC.Call(ctx, req.To, req.Path, req.Body, &raw); err != nil {
+	if err := r.call(ctx, req.To, req.Path, req.Class, req.Body, &raw); err != nil {
 		var ae *api.Error
 		if errors.As(err, &ae) {
 			return nil, ae
@@ -316,8 +480,8 @@ func (r *Router) TopicHome(name string) (TopicSummary, bool) {
 	return TopicSummary{}, false
 }
 
-// GlobalTopics lists global topics known to other (reachable) regions.
-func (r *Router) GlobalTopics() []TopicSummary {
+// RemoteTopics lists topics known to other (reachable) regions; keep filters them.
+func (r *Router) RemoteTopics(keep func(TopicSummary) bool) []TopicSummary {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	seen := map[string]TopicSummary{}
@@ -326,7 +490,7 @@ func (r *Router) GlobalTopics() []TopicSummary {
 			continue
 		}
 		for _, t := range ts {
-			if t.Residency == api.ResidencyGlobal {
+			if keep == nil || keep(t) {
 				seen[t.Name] = t
 			}
 		}

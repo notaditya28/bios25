@@ -17,6 +17,7 @@ import (
 	"github.com/notaditya28/hydra-stream/internal/fsutil"
 	"github.com/notaditya28/hydra-stream/internal/meta"
 	"github.com/notaditya28/hydra-stream/internal/residency"
+	"github.com/notaditya28/hydra-stream/internal/route"
 	"github.com/notaditya28/hydra-stream/internal/rpc"
 	"github.com/notaditya28/hydra-stream/internal/seglog"
 )
@@ -52,15 +53,32 @@ func DefaultTiming() Timing {
 }
 
 // Sender delivers internal requests about a partition to another broker. The geo router
-// implements it to route global partitions' cross-region traffic over the fastest path.
-type Sender interface {
-	Send(ctx context.Context, to, path, topic, residency string, in, out any) error
-}
+// implements it to route cross-region traffic over the fastest permitted path.
+type Sender = route.Sender
 
 type directSender struct{ c *rpc.Client }
 
-func (d directSender) Send(ctx context.Context, to, path, _, _ string, in, out any) error {
+func (d directSender) Send(ctx context.Context, to, path string, _ route.Opts, in, out any) error {
 	return d.c.Call(ctx, to, path, in, out)
+}
+
+// Recovery threshold: a follower further behind than this many bytes is catching up, and its
+// traffic is scheduled as recovery rather than live.
+const recoveryLagBytes = 1 << 20
+
+func (p *Partition) opts(class route.Class) route.Opts {
+	return route.Opts{Topic: p.Key.Topic, Residency: p.residency, Class: class}
+}
+
+// batchClasses returns the per-message policy classes carried in a batch's headers.
+func batchClasses(recs []seglog.Record) []string {
+	var out []string
+	for i := range recs {
+		if c := HeaderClass(recs[i].Headers); c != "" && !slices.Contains(out, c) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 type partState struct {
@@ -105,17 +123,26 @@ type Partition struct {
 	leaderSince time.Time
 	stopElect   context.CancelFunc
 
-	producers map[uint64]*producerState // idempotent producers' recent batches (see producers.go)
+	producers  map[uint64]*producerState // idempotent producers' recent batches (see producers.go)
+	allWaiters int                       // produce calls waiting for acks=all
+	applier    Applier                   // optional state machine over the records (internal topics)
+
+	priority string // topic priority ("urgent" gets the urgent traffic class)
+	dedupOn  bool   // wire-level payload dedup for cross-region followers (see dedup.go)
+	ddOnce   sync.Once
+	dedup    *dedupState
 }
 
-func openPartition(dir string, key meta.PartKey, res, self string, logCfg seglog.Config, send Sender, timing Timing, guard *residency.Guard) (*Partition, error) {
+const PriorityUrgent = "urgent"
+
+func openPartition(dir string, key meta.PartKey, cfg api.TopicConfig, self string, logCfg seglog.Config, send Sender, timing Timing, guard *residency.Guard, dedup bool, applier Applier) (*Partition, error) {
 	l, err := seglog.Open(dir, logCfg)
 	if err != nil {
 		return nil, err
 	}
 	p := &Partition{
-		Key: key, residency: res, guard: guard, self: self, log: l, state: filepath.Join(dir, "state.json"),
-		send: send, timing: timing, changed: make(chan struct{}),
+		Key: key, residency: cfg.Residency, priority: cfg.Priority, dedupOn: dedup, guard: guard, self: self, log: l,
+		state: filepath.Join(dir, "state.json"), send: send, timing: timing, changed: make(chan struct{}), applier: applier,
 	}
 	var st partState
 	if err := fsutil.ReadJSON(p.state, &st); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -156,6 +183,32 @@ func (p *Partition) stopReplicationLocked() {
 	}
 	p.followers = nil
 }
+
+// FollowerStat is the leader's view of one follower's progress.
+type FollowerStat struct {
+	ID      string
+	Match   uint64
+	End     uint64 // leader's log end
+	LastAck time.Time
+}
+
+// Followers reports follower progress (leader only; nil otherwise).
+func (p *Partition) Followers() []FollowerStat {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.role != RoleLeader {
+		return nil
+	}
+	end := p.log.EndOffset()
+	out := make([]FollowerStat, 0, len(p.followers))
+	for id, f := range p.followers {
+		out = append(out, FollowerStat{ID: id, Match: f.match, End: end, LastAck: f.lastAck})
+	}
+	return out
+}
+
+// Residency returns the partition's residency string.
+func (p *Partition) Residency() string { return p.residency }
 
 // Status is a snapshot for metadata APIs and tests.
 type Status struct {
@@ -302,10 +355,38 @@ func (p *Partition) quorumAliveLocked() bool {
 	return alive >= len(p.replicas)/2+1
 }
 
-// Produce appends records as leader and waits until a majority of replicas has them.
+// Acknowledgement modes (per request; see api.ProduceRequest.Acks).
+const (
+	AcksLeader = "leader" // appended on the leader
+	AcksQuorum = "quorum" // committed on a majority (the default)
+	AcksAll    = "all"    // on every replica
+)
+
+// Produce appends records as leader and waits for the requested durability (acks).
 // With pid != 0 the batch is idempotent: a retry of a batch already in the log (same producer,
 // same baseSeq) is not appended again; the call waits for and returns the original offsets.
-func (p *Partition) Produce(ctx context.Context, recs []seglog.Record, pid, baseSeq uint64) (uint64, error) {
+func (p *Partition) Produce(ctx context.Context, recs []seglog.Record, pid, baseSeq uint64, acks string) (uint64, error) {
+	return p.produce(ctx, recs, pid, baseSeq, acks, nil)
+}
+
+// ProduceIf appends records as leader only if cond (run under the partition lock, against the
+// applier's state, right before the append) returns nil: a compare-and-append used by internal
+// topics such as the checkpoint store to fence stale owners.
+func (p *Partition) ProduceIf(ctx context.Context, recs []seglog.Record, acks string, cond func() error) (uint64, error) {
+	return p.produce(ctx, recs, 0, 0, acks, cond)
+}
+
+// Applier returns the partition's state machine (nil for ordinary topics).
+func (p *Partition) Applier() Applier { return p.applier }
+
+// WithLock runs f under the partition lock (for consistent reads of the applier's state).
+func (p *Partition) WithLock(f func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	f()
+}
+
+func (p *Partition) produce(ctx context.Context, recs []seglog.Record, pid, baseSeq uint64, acks string, cond func() error) (uint64, error) {
 	p.mu.Lock()
 	if p.role != RoleLeader {
 		err := p.notLeaderLocked()
@@ -317,6 +398,12 @@ func (p *Partition) Produce(ctx context.Context, recs []seglog.Record, pid, base
 		e := api.Errorf(api.CodeNotEnoughReplicas, "%s: fewer than %d of %d replicas reachable", p.Key, len(p.replicas)/2+1, len(p.replicas))
 		e.Reason = "replicas_unreachable"
 		return 0, e
+	}
+	if cond != nil {
+		if err := cond(); err != nil {
+			p.mu.Unlock()
+			return 0, err
+		}
 	}
 	epoch := p.leaderEpoch
 	var base uint64
@@ -341,6 +428,7 @@ func (p *Partition) Produce(ctx context.Context, recs []seglog.Record, pid, base
 			if pid != 0 {
 				p.trackLocked(recs)
 			}
+			p.applyLocked(recs)
 			p.advanceHWLocked() // a single-replica partition commits immediately
 		}
 	}
@@ -352,14 +440,35 @@ func (p *Partition) Produce(ctx context.Context, recs []seglog.Record, pid, base
 		return 0, api.Errorf(api.CodeInternal, "append %s: %v", p.Key, err)
 	}
 
+	if acks == AcksLeader {
+		return base, nil // the caller asked only for the leader's copy
+	}
 	last := base + uint64(len(recs)) - 1
+	if acks == AcksAll {
+		p.mu.Lock()
+		p.allWaiters++
+		p.mu.Unlock()
+		defer func() {
+			p.mu.Lock()
+			p.allWaiters--
+			p.mu.Unlock()
+		}()
+	}
 	timer := time.NewTimer(p.timing.ProduceTimeout)
 	defer timer.Stop()
 	for {
 		p.mu.Lock()
 		hw, role, le, ch := p.hw, p.role, p.leaderEpoch, p.changed
+		done := hw > last
+		if done && acks == AcksAll {
+			for _, f := range p.followers {
+				if f.match <= last {
+					done = false
+				}
+			}
+		}
 		p.mu.Unlock()
-		if hw > last {
+		if done {
 			return base, nil
 		}
 		if role != RoleLeader || le != epoch {
@@ -370,6 +479,11 @@ func (p *Partition) Produce(ctx context.Context, recs []seglog.Record, pid, base
 		select {
 		case <-ch:
 		case <-timer.C:
+			if acks == AcksAll && hw > last {
+				e := api.Errorf(api.CodeNotEnoughReplicas, "%s: committed on a majority but not on every replica within %v", p.Key, p.timing.ProduceTimeout)
+				e.Reason = "all_ack_timeout"
+				return 0, e
+			}
 			e := api.Errorf(api.CodeNotEnoughReplicas, "%s: write not acknowledged by a majority within %v", p.Key, p.timing.ProduceTimeout)
 			e.Reason = "ack_timeout"
 			return 0, e
@@ -448,8 +562,9 @@ type AppendRequest struct {
 
 type AppendResponse struct {
 	OK        bool   `json:"ok"`
-	Epoch     uint64 `json:"epoch"`      // follower's epoch; > LeaderEpoch means the leader is stale
-	EndOffset uint64 `json:"end_offset"` // on success: matched up to here; on mismatch: retry from here
+	Epoch     uint64 `json:"epoch"`               // follower's epoch; > LeaderEpoch means the leader is stale
+	EndOffset uint64 `json:"end_offset"`          // on success: matched up to here; on mismatch: retry from here
+	NeedFull  bool   `json:"need_full,omitempty"` // a deduplicated value couldn't be resolved: resend in full
 }
 
 // handleAppend runs on a follower.
@@ -467,6 +582,9 @@ func (p *Partition) handleAppend(req *AppendRequest) (*AppendResponse, error) {
 		p.notifyLocked()
 	}
 	p.lastHeard = time.Now() // a valid leader is alive: hold off elections
+	if !p.resolveRefsLocked(req.Records) {
+		return &AppendResponse{Epoch: p.epoch, EndOffset: req.PrevOffset, NeedFull: true}, nil
+	}
 
 	leo := p.log.EndOffset()
 	if req.PrevOffset > leo {
@@ -521,6 +639,8 @@ func (p *Partition) handleAppend(req *AppendRequest) (*AppendResponse, error) {
 			return nil, api.Errorf(api.CodeInternal, "append %s: %v", p.Key, err)
 		}
 		p.trackLocked(recs)
+		p.applyLocked(recs)
+		p.indexValuesLocked(recs)
 	}
 	match := req.PrevOffset + uint64(len(req.Records))
 	if hw := min(req.HW, match); hw > p.hw {
@@ -532,8 +652,9 @@ func (p *Partition) handleAppend(req *AppendRequest) (*AppendResponse, error) {
 
 // replicate streams our log to one follower while we lead at epoch.
 func (p *Partition) replicate(ctx context.Context, to string, epoch uint64) {
-	if err := p.guard.CheckPeer(p.Key.Topic, p.residency, to, "replicate to"); err != nil {
-		return // never ship resident data out of its region, whatever the metadata says
+	if err := p.guard.Do(residency.Check{Topic: p.Key.Topic, Partition: p.Key.Partition, Residency: p.residency,
+		Hop: "replicate-send", Peer: to, Need: residency.Store, Batch: fmt.Sprintf("epoch %d", epoch)}); err != nil {
+		return // never ship data to a broker its policy doesn't allow, whatever the metadata says
 	}
 	next := p.log.EndOffset()
 	backoff := 20 * time.Millisecond
@@ -559,7 +680,11 @@ func (p *Partition) replicate(ctx context.Context, to string, epoch uint64) {
 			req.PrevEpoch = e
 		}
 		if next < end {
-			recs, err := p.log.Read(next, end, p.timing.MaxBatch, 4<<20)
+			maxBytes := 4 << 20
+			if p.guard.RegionOf(to) != p.guard.Region() {
+				maxBytes = 256 << 10 // smaller cross-region batches bound how long one batch holds a shaped link
+			}
+			recs, err := p.log.Read(next, end, p.timing.MaxBatch, maxBytes)
 			if err != nil {
 				slog.Error("read for replication", "partition", p.Key, "err", err)
 				time.Sleep(backoff)
@@ -571,11 +696,26 @@ func (p *Partition) replicate(ctx context.Context, to string, epoch uint64) {
 		req.HW = p.hw
 		p.mu.Unlock()
 
+		o := p.opts(route.Live)
+		switch {
+		case p.priority == PriorityUrgent:
+			o.Class = route.Urgent
+		case end-next > uint64(p.timing.MaxBatch):
+			o.Class = route.Recovery // more than one batch behind: catch-up traffic
+		}
+		if o.Classes = batchClasses(req.Records); len(o.Classes) > 0 {
+			o.Narrow = p.narrowFor(o.Classes)
+		}
+		p.dedupOutgoing(to, &req)
+
 		lastSent = time.Now()
 		rctx, cancel := context.WithTimeout(ctx, p.timing.RPCTimeout)
 		var resp AppendResponse
-		err := p.send.Send(rctx, to, PathAppend, p.Key.Topic, p.residency, req, &resp)
+		err := p.send.Send(rctx, to, PathAppend, o, req, &resp)
 		cancel()
+		if err == nil {
+			p.dedupAcked(to, &req, &resp)
+		}
 		if err != nil {
 			if ctx.Err() == nil {
 				time.Sleep(backoff)
@@ -604,8 +744,13 @@ func (p *Partition) ackFollower(id string, epoch, match uint64) {
 	if p.role != RoleLeader || p.leaderEpoch != epoch || !ok {
 		return
 	}
+	grew := match > f.match
 	f.match, f.lastAck = match, time.Now()
+	before := p.hw
 	p.advanceHWLocked()
+	if grew && p.allWaiters > 0 && p.hw == before {
+		p.notifyLocked() // acks=all waiters need every follower's progress, not just the HW
+	}
 }
 
 // advanceHWLocked moves the high watermark to the highest offset a majority of replicas has.

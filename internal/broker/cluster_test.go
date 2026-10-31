@@ -2,6 +2,8 @@ package broker
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"net"
@@ -43,6 +45,7 @@ type cluster struct {
 	group map[string]map[string]string // broker -> its coordination group (region peers)
 	dir   map[string]api.Info
 	root  string
+	admin ed25519.PrivateKey // signs policy documents for this cluster
 }
 
 // newGeo starts a real multi-region cluster: each region its own coordination group.
@@ -85,6 +88,7 @@ func newClusterRegions(t *testing.T, regions []string) *cluster {
 func newClusterGroups(t *testing.T, regions []string, perRegionGroups bool) *cluster {
 	t.Helper()
 	c := &cluster{t: t, peers: map[string]string{}, group: map[string]map[string]string{}, dir: map[string]api.Info{}, root: t.TempDir()}
+	_, c.admin, _ = ed25519.GenerateKey(rand.Reader)
 	count := map[string]int{}
 	for _, region := range regions {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -127,6 +131,7 @@ func (c *cluster) start(i int) {
 		Info:    c.dir[nd.id],
 		DataDir: nd.dir, Regions: []string{"IN", "EU", "US"}, Peers: c.group[nd.id], Addrs: c.peers, Directory: c.dir,
 		Log: seglog.Config{SegmentBytes: 256 << 10}, Coord: ct, Replica: rt, Net: nd.net, Probe: 50 * time.Millisecond,
+		PolicyKey: c.admin.Public().(ed25519.PublicKey),
 	})
 	if err != nil {
 		c.t.Fatal(err)

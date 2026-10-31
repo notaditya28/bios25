@@ -6,6 +6,8 @@ import (
 	"math/rand/v2"
 	"sync"
 	"time"
+
+	"github.com/notaditya28/hydra-stream/internal/route"
 )
 
 // Leader election for self-elected partitions (global topics: one replica per region, no
@@ -148,7 +150,7 @@ func (p *Partition) collectVotes(ctx context.Context, replicas []string, req Vot
 		go func() {
 			defer wg.Done()
 			var resp VoteResponse
-			if err := p.send.Send(ctx, r, PathVote, p.Key.Topic, p.residency, req, &resp); err != nil {
+			if err := p.send.Send(ctx, r, PathVote, p.opts(route.Control), req, &resp); err != nil {
 				return
 			}
 			if !req.Pre && resp.Epoch > req.Epoch {

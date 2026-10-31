@@ -35,6 +35,11 @@ type Manager struct {
 	timing  Timing
 	guard   *residency.Guard
 	send    Sender
+	dedup   bool
+	// selfElected reports whether a topic's partitions elect their own leaders (their data
+	// spans regions, so no single region controller may assign leaders).
+	selfElected func(api.TopicConfig) bool
+	newApplier  func(topic string, partition int) Applier
 
 	mu     sync.RWMutex
 	parts  map[meta.PartKey]*Partition
@@ -46,15 +51,28 @@ func NewManager(self, dataDir string, logCfg seglog.Config, client *rpc.Client, 
 		timing.ElectionTimeout = DefaultTiming().ElectionTimeout
 	}
 	return &Manager{self: self, dataDir: dataDir, logCfg: logCfg, rpc: client, timing: timing, guard: guard,
-		send: directSender{client}, parts: map[meta.PartKey]*Partition{}}
+		send: directSender{client}, parts: map[meta.PartKey]*Partition{}, dedup: true,
+		selfElected: func(cfg api.TopicConfig) bool { return cfg.Residency == api.ResidencyGlobal }}
 }
 
 // SetSender routes partition traffic (replication, votes) through s, e.g. the geo router.
 func (m *Manager) SetSender(s Sender) { m.send = s }
 
-// selfElected reports whether a partition elects its own leader: global topics span regions,
-// so no region controller may assign their leaders.
-func selfElected(cfg api.TopicConfig) bool { return cfg.Residency == api.ResidencyGlobal }
+// SetSelfElected sets the rule deciding which topics elect their own leaders.
+func (m *Manager) SetSelfElected(f func(api.TopicConfig) bool) { m.selfElected = f }
+
+// SetDedup turns wire-level payload dedup for cross-region followers on or off.
+func (m *Manager) SetDedup(on bool) { m.dedup = on }
+
+// SetApplier installs a factory for per-partition state machines (nil result = none).
+func (m *Manager) SetApplier(f func(topic string, partition int) Applier) { m.newApplier = f }
+
+func (m *Manager) applierFor(topic string, part int) Applier {
+	if m.newApplier == nil {
+		return nil
+	}
+	return m.newApplier(topic, part)
+}
 
 func (m *Manager) Get(key meta.PartKey) *Partition {
 	m.mu.RLock()
@@ -97,7 +115,7 @@ func (m *Manager) ensure(cfg api.TopicConfig, part int) (*Partition, error) {
 			return nil, err
 		}
 	}
-	p, err := openPartition(layout.PartitionDir(m.dataDir, cfg.Name, part), key, cfg.Residency, m.self, m.logCfg, m.send, m.timing, m.guard)
+	p, err := openPartition(layout.PartitionDir(m.dataDir, cfg.Name, part), key, cfg, m.self, m.logCfg, m.send, m.timing, m.guard, m.dedup, m.applierFor(cfg.Name, part))
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", key, err)
 	}
@@ -118,7 +136,7 @@ func (m *Manager) Open(md *meta.Metadata) error {
 			if err != nil && api.CodeOf(err) != api.CodeResidencyViolation {
 				return err
 			}
-			if p != nil && selfElected(t.Config) {
+			if p != nil && m.selfElected(t.Config) {
 				p.startSelfElected(pm.Replicas)
 			}
 		}
@@ -138,7 +156,7 @@ func (m *Manager) Apply(md *meta.Metadata) {
 				slog.Error("open replica", "topic", t.Config.Name, "partition", i, "err", err)
 				continue
 			}
-			if selfElected(t.Config) {
+			if m.selfElected(t.Config) {
 				p.startSelfElected(pm.Replicas)
 				continue
 			}
@@ -176,14 +194,16 @@ func (m *Manager) Register(mux *http.ServeMux) {
 		if p != nil {
 			res = p.residency // our own tag is authoritative
 		}
-		// Refuse resident data that would land here, or that arrives from outside its region.
+		// Refuse data that may not be stored here; the leader must itself be allowed to store it,
+		// and the broker that delivered it (the leader or a relay) must be allowed to carry it.
 		if err := m.guard.CheckStore(req.Topic, res); err != nil {
 			return nil, err
 		}
-		for _, from := range []string{rpc.From(ctx), req.Leader} {
-			if err := m.guard.CheckPeer(req.Topic, res, from, "accept replication from"); err != nil {
-				return nil, err
-			}
+		if err := m.guard.CheckPeer(req.Topic, res, req.Leader, "accept replication from leader"); err != nil {
+			return nil, err
+		}
+		if err := m.guard.CheckPeerTransit(req.Topic, res, rpc.From(ctx), "accept replication via"); err != nil {
+			return nil, err
 		}
 		if p == nil {
 			return nil, api.Errorf(api.CodeUnknownPartition, "%s has no replica of %s/%d", m.self, req.Topic, req.Partition)

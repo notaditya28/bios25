@@ -109,6 +109,17 @@ func (l *Log) EndOffset() uint64 {
 	return l.nextLocked()
 }
 
+// Bytes is the log's size on disk.
+func (l *Log) Bytes() int64 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	var n int64
+	for _, s := range l.segs {
+		n += s.size
+	}
+	return n
+}
+
 // StartOffset is the first offset still in the log.
 func (l *Log) StartOffset() uint64 {
 	l.mu.RLock()
@@ -158,7 +169,7 @@ func (l *Log) writeLocked(recs []Record) error {
 	}
 	size := 0
 	for i := range recs {
-		if len(recs[i].Key)+len(recs[i].Value) > MaxRecordSize {
+		if payloadSize(&recs[i]) > MaxRecordSize {
 			return ErrRecordTooLarge
 		}
 		size += encodedSize(&recs[i])

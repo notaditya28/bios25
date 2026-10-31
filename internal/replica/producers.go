@@ -57,10 +57,32 @@ func (p *Partition) trackLocked(recs []seglog.Record) {
 	}
 }
 
-// rebuildProducersLocked recomputes the producer table from the whole log (at open and after
-// a truncation removed records).
+// Applier is a state machine over a partition's records, used by internal topics (e.g. the
+// consumer checkpoint store). It sees every record appended to this replica in log order and is
+// rebuilt from the log on open and after a truncation, so every replica holds the same state.
+type Applier interface {
+	Reset()
+	Apply(rec seglog.Record)
+}
+
+func (p *Partition) applyLocked(recs []seglog.Record) {
+	if p.applier == nil {
+		return
+	}
+	for _, r := range recs {
+		if !r.IsControl() {
+			p.applier.Apply(r)
+		}
+	}
+}
+
+// rebuildProducersLocked recomputes the producer table (and the applier's state) from the whole
+// log (at open and after a truncation removed records).
 func (p *Partition) rebuildProducersLocked() {
 	p.producers = nil
+	if p.applier != nil {
+		p.applier.Reset()
+	}
 	end := p.log.EndOffset()
 	for off := p.log.StartOffset(); off < end; {
 		recs, err := p.log.Read(off, end, 5000, 4<<20)
@@ -71,6 +93,7 @@ func (p *Partition) rebuildProducersLocked() {
 			return
 		}
 		p.trackLocked(recs)
+		p.applyLocked(recs)
 		off = recs[len(recs)-1].Offset + 1
 	}
 }

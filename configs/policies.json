@@ -1,0 +1,32 @@
+{
+  "policies": [
+    {
+      "class": "public",
+      "description": "Anything public: store and route anywhere.",
+      "storage_regions": ["*"]
+    },
+    {
+      "class": "telemetry",
+      "description": "High-volume sensor data: anywhere, latency first (leader acknowledgement is enough).",
+      "storage_regions": ["*"],
+      "min_acks": "leader"
+    },
+    {
+      "class": "pii-in",
+      "description": "Indian personal data: stored and routed only inside India.",
+      "storage_regions": ["IN"]
+    },
+    {
+      "class": "eu-personal",
+      "description": "EU personal data: stored in the EU; may pass through US brokers (e.g. to serve US clients) but never be stored there.",
+      "storage_regions": ["EU"],
+      "transit_regions": ["US"]
+    },
+    {
+      "class": "financial",
+      "description": "Financial transactions: stored in India and the EU, never stored in or routed through the US; every replica must confirm.",
+      "storage_regions": ["IN", "EU"],
+      "min_acks": "all"
+    }
+  ]
+}
