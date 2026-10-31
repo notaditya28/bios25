@@ -22,6 +22,7 @@ func main() {
 	trust := flag.String("trust", "", "pinned broker keys file (default <data>/audit-trust.json)")
 	jsonOut := flag.String("json", "", "also write the report as JSON to this file")
 	warnings := flag.Bool("warnings", false, "list warnings, not just violations")
+	policies := flag.String("policies", "configs/policies.signed.json", "signed policy document for policy:<class> data")
 	flag.Parse()
 
 	cluster, err := config.Load(*cfgPath)
@@ -32,7 +33,7 @@ func main() {
 	if *trust == "" {
 		*trust = filepath.Join(*dataRoot, "audit-trust.json")
 	}
-	rep, err := audit.Run(context.Background(), cluster, audit.Options{DataRoot: *dataRoot, Online: *online, TrustFile: *trust})
+	rep, err := audit.Run(context.Background(), cluster, audit.Options{DataRoot: *dataRoot, Online: *online, TrustFile: *trust, PolicyFile: *policies})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(2)

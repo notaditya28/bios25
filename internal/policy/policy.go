@@ -262,6 +262,29 @@ func (e *Engine) Install(s *Signed) error {
 	return nil
 }
 
+// ForSimulation returns an engine holding d WITHOUT signature checks. It exists only so the
+// scenario simulator can evaluate proposed (not yet signed) policy changes with exactly the same
+// resolution code the brokers use; brokers never construct engines this way.
+func ForSimulation(d Document, regions []string) *Engine {
+	e := NewEngine(nil, regions)
+	by := map[string]Policy{}
+	for _, p := range d.Policies {
+		by[p.Class] = p
+	}
+	e.current, e.byClass = &Signed{Document: d}, by
+	return e
+}
+
+// Document returns the installed document (zero value if none).
+func (e *Engine) Document() Document {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.current == nil {
+		return Document{}
+	}
+	return e.current.Document
+}
+
 func (e *Engine) Current() *Signed {
 	e.mu.RLock()
 	defer e.mu.RUnlock()

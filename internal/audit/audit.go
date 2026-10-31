@@ -26,7 +26,7 @@ import (
 	"github.com/notaditya28/hydra-stream/internal/fsutil"
 	"github.com/notaditya28/hydra-stream/internal/layout"
 	"github.com/notaditya28/hydra-stream/internal/manifest"
-	"github.com/notaditya28/hydra-stream/internal/residency"
+	"github.com/notaditya28/hydra-stream/internal/policy"
 )
 
 const (
@@ -73,6 +73,53 @@ type Options struct {
 	Online    bool          // also verify signed manifests from live brokers
 	TrustFile string        // pinned broker public keys (trust on first use); "" = don't pin
 	Timeout   time.Duration // per manifest request
+	// Policies evaluates "policy:<class>" residencies. If nil, one is built from the cluster
+	// config's policy key and PolicyFile (a signed document); without a valid document,
+	// policy-tagged data is reported as unverifiable (the audit fails closed too).
+	Policies   *policy.Engine
+	PolicyFile string
+}
+
+// judge decides whether data with residency res may be stored in region: "" if fine, else the
+// rule broken and why.
+type judge func(res, region string) (rule, detail string)
+
+func newJudge(eng *policy.Engine) judge {
+	return func(res, region string) (string, string) {
+		eff, err := eng.Resolve(res)
+		if err != nil {
+			if strings.HasPrefix(res, policy.Prefix) {
+				return "policy-unverifiable", fmt.Sprintf("policy %q can't be verified: %v", res, err)
+			}
+			return "unknown-residency", fmt.Sprintf("residency tag %q is neither global, a cluster region nor a policy class", res)
+		}
+		if !eff.CanStore(region) {
+			return "residency", fmt.Sprintf("data under %s (v%d) may not be stored in region %s", eff.Name, eff.Version, region)
+		}
+		return "", ""
+	}
+}
+
+func buildEngine(cluster *config.Cluster, opts Options, rep *Report) *policy.Engine {
+	if opts.Policies != nil {
+		return opts.Policies
+	}
+	var key []byte
+	if p := cluster.PolicyKeyPath(); p != "" {
+		if k, err := policy.LoadPublicKey(p); err == nil {
+			key = k
+		}
+	}
+	eng := policy.NewEngine(key, cluster.RegionNames())
+	if opts.PolicyFile != "" {
+		var s policy.Signed
+		if err := fsutil.ReadJSON(opts.PolicyFile, &s); err == nil {
+			if err := eng.Install(&s); err != nil {
+				rep.add(Warning, "", "", nil, "policy-document", "policy document %s rejected: %v", opts.PolicyFile, err)
+			}
+		}
+	}
+	return eng
 }
 
 func (r *Report) add(sev, broker, topic string, part *int, rule, format string, args ...any) {
@@ -92,10 +139,7 @@ func Run(ctx context.Context, cluster *config.Cluster, opts Options) (*Report, e
 		opts.Timeout = 10 * time.Second
 	}
 	rep := &Report{GeneratedAt: time.Now().UTC(), DataRoot: opts.DataRoot, Online: opts.Online, Findings: []Finding{}}
-	regions := map[string]bool{}
-	for _, r := range cluster.Regions {
-		regions[r.Name] = true
-	}
+	regions := newJudge(buildEngine(cluster, opts, rep))
 	trust := map[string]string{}
 	if opts.Online && opts.TrustFile != "" {
 		if err := fsutil.ReadJSON(opts.TrustFile, &trust); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -161,7 +205,7 @@ func Run(ctx context.Context, cluster *config.Cluster, opts Options) (*Report, e
 	return rep, nil
 }
 
-func checkScan(rep *Report, sum *BrokerSummary, id, region string, regions map[string]bool, scan *layout.BrokerScan) {
+func checkScan(rep *Report, sum *BrokerSummary, id, region string, judge judge, scan *layout.BrokerScan) {
 	switch {
 	case scan.Identity == nil && scan.HasData():
 		rep.add(Violation, id, "", nil, "unidentified-data", "data directory has partitions but no readable %s", layout.IdentityFile)
@@ -187,22 +231,21 @@ func checkScan(rep *Report, sum *BrokerSummary, id, region string, regions map[s
 		} else {
 			sum.Resident += len(t.Partitions)
 		}
-		if res != api.ResidencyGlobal && !regions[res] {
-			rep.add(Violation, id, t.Name, nil, "unknown-residency", "residency tag %q is neither global nor a cluster region", res)
-			continue
-		}
-		if !residency.Allowed(res, region) {
+		switch rule, detail := judge(res, region); rule {
+		case "":
+		case "residency":
 			for _, p := range t.Partitions {
-				rep.add(Violation, id, t.Name, intp(p), "residency",
-					"data resident in %s is stored on %s, which is in region %s", res, id, region)
+				rep.add(Violation, id, t.Name, intp(p), rule, "%s; stored on %s", detail, id)
 			}
+		default:
+			rep.add(Violation, id, t.Name, nil, rule, "%s", detail)
 		}
 	}
 }
 
 // checkManifest verifies and checks a broker's fetched manifest. It reports whether trust changed.
 func checkManifest(rep *Report, sum *BrokerSummary, bc config.Broker, region string,
-	regions map[string]bool, scan *layout.BrokerScan, trust map[string]string, s *manifest.Signed, err error) bool {
+	judge judge, scan *layout.BrokerScan, trust map[string]string, s *manifest.Signed, err error) bool {
 	if err != nil {
 		sum.Manifest = "unreachable"
 		rep.add(Warning, bc.ID, "", nil, "manifest-unreachable", "could not fetch manifest (broker down?): %v; disk scan still applies", err)
@@ -241,11 +284,8 @@ func checkManifest(rep *Report, sum *BrokerSummary, bc config.Broker, region str
 		reported[key{e.Topic, e.Partition, e.File}] = true
 		if e.Residency == "" {
 			rep.add(Violation, bc.ID, e.Topic, intp(e.Partition), "untagged-data", "manifest reports segment %s without a residency tag", e.File)
-		} else if e.Residency != api.ResidencyGlobal && !regions[e.Residency] {
-			rep.add(Violation, bc.ID, e.Topic, intp(e.Partition), "unknown-residency", "manifest reports residency %q", e.Residency)
-		} else if !residency.Allowed(e.Residency, region) {
-			rep.add(Violation, bc.ID, e.Topic, intp(e.Partition), "residency",
-				"manifest reports data resident in %s on %s, which is in region %s", e.Residency, bc.ID, region)
+		} else if rule, detail := judge(e.Residency, region); rule != "" {
+			rep.add(Violation, bc.ID, e.Topic, intp(e.Partition), rule, "manifest reports: %s (on %s)", detail, bc.ID)
 		}
 	}
 	if scan == nil {

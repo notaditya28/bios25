@@ -118,3 +118,8 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
+
+// Get fetches any JSON endpoint on the broker (e.g. the /admin/v1 views).
+func (c *Client) Get(ctx context.Context, path string, out any) error {
+	return c.do(ctx, http.MethodGet, path, nil, out)
+}

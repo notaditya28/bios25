@@ -308,15 +308,7 @@ func (r *Router) recompute() {
 		via, cost := r.bestRelayLocked(to, nil)
 		cur := r.routes[to]
 		next := ""
-		switch {
-		case via == "":
-		case math.IsInf(direct, 1):
-			next = via // direct link down: any working relay beats nothing
-		case direct-cost < minGainMs:
-			// Not worth an extra hop: sub-10ms differences are measurement noise on a LAN.
-		case cur != "" && cost < stayRatio*direct:
-			next = via
-		case cost < switchRatio*direct:
+		if via != "" && ChooseRelay(direct, cost, cur != "") {
 			next = via
 		}
 		if next != cur {
@@ -328,6 +320,24 @@ func (r *Router) recompute() {
 			r.routes[to] = next
 		}
 	}
+}
+
+// ChooseRelay is the routing rule, shared by the live router and the scenario simulator:
+// given the direct round trip and the best permitted two-hop round trip (ms; +Inf = no path),
+// relay when the direct path is down, or when relaying is at least 30% faster AND saves at
+// least 10 ms; keep an existing relay while it stays 10% faster (hysteresis).
+func ChooseRelay(direct, relay float64, relaying bool) bool {
+	switch {
+	case math.IsInf(relay, 1):
+		return false
+	case math.IsInf(direct, 1):
+		return true
+	case direct-relay < minGainMs:
+		return false
+	case relaying && relay < stayRatio*direct:
+		return true
+	}
+	return relay < switchRatio*direct
 }
 
 func round(f float64) float64 {
@@ -375,7 +385,7 @@ func (r *Router) chooseVia(to string, eff policy.Effective, want string) (string
 		direct = r.rtt[to]
 	}
 	via, cost := r.bestRelayLocked(to, eff.CanTransit)
-	if via != "" && (math.IsInf(direct, 1) || (cost < switchRatio*direct && direct-cost >= minGainMs)) {
+	if via != "" && ChooseRelay(direct, cost, false) {
 		return via, nil
 	}
 	return "", nil
