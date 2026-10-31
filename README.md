@@ -11,6 +11,10 @@ routes around slow links, and a regional outage never freezes the surviving regi
 - [x] Milestone 4 — independent regions; global topics with cross-region quorum and self-elected leaders; latency-aware relay routing
 - [x] Milestone 5 — idempotent producer; `hydra-chaos` harness + correctness checker (all 6 scenarios PASS)
 - [x] Milestone 6 — dashboard + one-command demo
+- [x] Milestone 7 — seven improvements over Pulsar-style brokers: granular fenced checkpoints, adaptive
+      replication bandwidth, signed message-level jurisdiction (storage vs transit), recovery forecasts,
+      a what-if simulator validated against the real cluster, cross-region payload dedup, per-message
+      durability modes. Details and measurements: NOTES.md ("Milestone 7") and `HYDRA_FEATURES.pdf`.
 
 ## Demo in one command
 ```powershell
@@ -97,6 +101,23 @@ go build -o bin/ ./cmd/...
 Results also land in `results/chaos-<time>.md` and `.json`. Latest run: see NOTES.md
 ("Chaos results") — 0 lost, 0 duplicates, 0 order violations in all 6 scenarios.
 
+Signed jurisdiction policies (classes in `configs/policies.json`; `start`, `demo` and `chaos` do
+this automatically):
+```powershell
+.\bin\hydra-policy.exe ensure          # admin key + signed configs/policies.signed.json (once)
+.\bin\hydra-policy.exe push            # install on every running broker (signature verified)
+.\bin\hydra.exe create-topic -b 127.0.0.1:9201 -name payments -partitions 2 -residency policy:financial
+Invoke-RestMethod "http://127.0.0.1:9301/admin/v1/decisions?deny=1&limit=5"   # per-hop decision trail
+```
+
+What-if before it happens, and benchmarks against baselines on the same code paths:
+```powershell
+.\bin\hydra-sim.exe -preset guide                          # six standard what-ifs
+.\bin\hydra-sim.exe -step storage_remove:financial:EU       # dry-run a policy change
+.\bin\hydra-sim.exe -broker 127.0.0.1:9101 -step region_isolate:US   # live topics + measured RTTs
+.\bin\hydra-bench.exe -out results\bench.md                # bandwidth, checkpoint, policy-cost
+```
+
 Raw HTTP works too:
 ```powershell
 curl.exe -s -X POST localhost:9101/v1/topics/orders/records -d '{\"records\":[{\"key\":\"u1\",\"value\":\"hello\"}]}'
@@ -122,6 +143,15 @@ internal/audit          residency audit rules and compliance report
 cmd/residency_audit     audit CLI (exit 1 on violations)
 cmd/hydra-chaos         chaos harness: real processes, faults, load, checker, results table
 cmd/hydra-dash          one-command demo: starts the cluster + load, serves the dashboard
+cmd/hydra-policy        admin key, sign / ensure / push / show signed policy documents
+cmd/hydra-sim           what-if simulator (failures, link changes, traffic, policy changes)
+cmd/hydra-bench         benchmarks vs FIFO / fixed-share / offset-only baselines
+internal/policy         signed policy documents, storage vs transit, narrowing, fail-closed engine
+internal/trail          append-only per-hop jurisdiction decision log
+internal/flow           per-link scheduler: token bucket + fair queuing + AIMD recovery share
+internal/forecast       EWMA rate estimates, time-to-clear / time-to-full
+internal/sim            simulator on the brokers' own placement / quorum / policy / routing code
+internal/placement      replica placement shared by brokers and simulator
 internal/dash           dashboard server (state polling, fault actions) + embedded page
 internal/chaos          process control, fault injection, load streams, verification, report
 internal/client         also: idempotent Producer (producer id + sequence, retry without duplicates)

@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Hydra Stream — Feature Guide</title>
+<style>
+@page { size: A4; margin: 16mm 15mm 18mm 15mm; }
+:root {
+  --ink: #16161a; --ink2: #44444c; --muted: #77767f; --rule: #dcdbe2; --bg2: #f4f3f8;
+  --accent: #4b3fc4; --in: #2a78d6; --eu: #d95926; --us: #1b9e70; --good: #0b8a0b; --bad: #c03030; --warn: #b07800;
+}
+* { box-sizing: border-box; }
+body { font: 10.3pt/1.5 "Segoe UI", system-ui, sans-serif; color: var(--ink); margin: 0; }
+h1 { font-size: 26pt; margin: 0 0 4mm; letter-spacing: -.3px; }
+h2 { font-size: 16pt; margin: 0 0 3mm; padding-bottom: 1.5mm; border-bottom: 2px solid var(--accent); }
+h3 { font-size: 11.5pt; margin: 5mm 0 1.5mm; color: var(--accent); }
+h4 { font-size: 10.3pt; margin: 3mm 0 1mm; }
+p { margin: 0 0 2.2mm; }
+ul, ol { margin: 0 0 2.5mm; padding-left: 5.5mm; }
+li { margin: .6mm 0; }
+code { font: 9pt Consolas, "Cascadia Mono", monospace; background: var(--bg2); padding: 0 1.2mm; border-radius: 2px; }
+pre { font: 8.6pt/1.4 Consolas, monospace; background: var(--bg2); padding: 2.5mm 3mm; border-radius: 3px; margin: 0 0 3mm; white-space: pre-wrap; }
+table { width: 100%; border-collapse: collapse; margin: 1.5mm 0 3.5mm; font-size: 9.2pt; page-break-inside: avoid; }
+th, td { text-align: left; padding: 1.4mm 2mm; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { background: var(--bg2); font-weight: 600; }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+.section { page-break-before: always; }
+.cover { height: 255mm; display: flex; flex-direction: column; justify-content: center; }
+.cover .tag { color: var(--accent); font-weight: 600; letter-spacing: 1.5px; font-size: 10pt; text-transform: uppercase; }
+.cover .sub { font-size: 13pt; color: var(--ink2); max-width: 150mm; }
+.cover .meta { margin-top: 14mm; color: var(--muted); font-size: 9.5pt; }
+.box { border: 1px solid var(--rule); border-left: 3px solid var(--accent); padding: 2.5mm 3.5mm; margin: 2mm 0 3.5mm; background: #fbfbfd; page-break-inside: avoid; }
+.box.good { border-left-color: var(--good); }
+.box.warn { border-left-color: var(--warn); }
+.box b.lbl { display: block; font-size: 8.6pt; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); margin-bottom: .8mm; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 4mm; }
+.kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 3mm; margin: 3mm 0 5mm; }
+.kpi { border: 1px solid var(--rule); border-radius: 3px; padding: 2.5mm 3mm; }
+.kpi .v { font-size: 17pt; font-weight: 650; color: var(--accent); }
+.kpi .l { font-size: 8.4pt; color: var(--ink2); }
+.yes { color: var(--good); font-weight: 600; }
+.no { color: var(--bad); }
+.part { color: var(--warn); }
+.fig { margin: 2mm 0 4mm; page-break-inside: avoid; }
+.fig .cap { font-size: 8.6pt; color: var(--muted); margin-top: 1mm; }
+.toc li { margin: 1mm 0; }
+.small { font-size: 8.8pt; color: var(--ink2); }
+svg text { font-family: "Segoe UI", sans-serif; }
+</style>
+</head>
+<body>
+
+<!-- ============ COVER ============ -->
+<div class="cover">
+  <div class="tag">SDG 9.1 · Resilient infrastructure</div>
+  <h1>Hydra Stream<br>Feature Guide</h1>
+  <p class="sub">A region-aware, Kafka-style message broker that keeps data inside its legal jurisdiction,
+  routes around slow links, and keeps the surviving regions running when a whole region fails.
+  This guide explains every feature: what it does, how it works, how it compares with Apache Kafka
+  and Apache Pulsar, and the measurements behind each claim.</p>
+  <div class="kpis">
+    <div class="kpi"><div class="v">0</div><div class="l">acknowledged messages lost or duplicated across 6 chaos scenarios (~904k msgs)</div></div>
+    <div class="kpi"><div class="v">11×</div><div class="l">lower live-traffic p95 delay during recovery (57 ms vs 632 ms FIFO)</div></div>
+    <div class="kpi"><div class="v">8.8×</div><div class="l">fewer duplicate reprocessings after a consumer crash (67 vs 587, median)</div></div>
+    <div class="kpi"><div class="v">18/18</div><div class="l">simulator predictions matched the real cluster after a region failure</div></div>
+  </div>
+  <div class="meta">Version: Milestone 7 · Go, standard library only (no broker, queue or embedded database) · runs on one laptop<br>
+  Repository: <code>hydra-stream</code> · design notes in <code>NOTES.md</code> · raw results in <code>results/</code></div>
+</div>
+
+<!-- ============ CONTENTS ============ -->
+<div class="section">
+<h2>Contents</h2>
+<ol class="toc">
+  <li><b>How to read this guide</b> — the claims policy and baselines</li>
+  <li><b>Architecture in one page</b></li>
+  <li><b>Comparison at a glance</b> — Hydra Stream vs Kafka vs Pulsar</li>
+  <li><b>Part A — the core platform</b>
+    <ol>
+      <li>Segmented append-only log (no database)</li>
+      <li>In-region replication with lease + epoch fencing</li>
+      <li>Independent regions and cross-region quorum for global topics</li>
+      <li>Latency-aware relay routing</li>
+      <li>Residency guard on every data path</li>
+      <li>Signed segment manifests and <code>residency_audit</code></li>
+      <li>Fast, specific errors</li>
+      <li>Idempotent producer</li>
+      <li>Chaos harness and correctness checker</li>
+      <li>One-command demo and dashboard</li>
+    </ol></li>
+  <li><b>Part B — the seven improvements</b>
+    <ol>
+      <li>Granular failover checkpoints</li>
+      <li>Adaptive replication bandwidth controller</li>
+      <li>Message-level jurisdiction enforcement</li>
+      <li>Predictive backlog and storage forecasts</li>
+      <li>Pre-deployment failure and policy simulator</li>
+      <li>Cross-region payload deduplication</li>
+      <li>Per-message delivery and durability modes</li>
+    </ol></li>
+  <li><b>Part C — extras</b>: metrics, compliance evidence, one-command signed policies</li>
+  <li><b>Measured results</b> — full tables</li>
+  <li><b>Limitations and honest notes</b></li>
+  <li><b>How to reproduce every number</b></li>
+</ol>
+
+<h3>1. How to read this guide</h3>
+<p>Every claim in this guide is backed by a test, a benchmark or a chaos run in the repository, and
+the command that reproduces it is listed in section 9. Two rules shaped the comparisons:</p>
+<ul>
+  <li><b>Fair baselines on the same code.</b> Running Kafka or Pulsar was not allowed in this project, so every
+    "before vs after" number compares Hydra's algorithm with the standard alternative implemented as a mode of
+    the <i>same</i> code: a FIFO replicator, a fixed replication rate limit, a single committed offset. That isolates the
+    algorithmic difference and avoids comparing a laptop prototype's raw speed with a tuned production system.</li>
+  <li><b>Medians and tails, not best runs.</b> Benchmarks repeat and report the median, and p95/p99 where tails matter.</li>
+</ul>
+<p>When this guide says Kafka or Pulsar "does not" do something, it refers to their standard, documented
+features (Kafka: committed offsets, static replication throttles, MirrorMaker 2 / cluster linking for geo;
+Pulsar: namespace-level geo-replication with allowed clusters, individual acks for shared subscriptions,
+dispatch-rate limits). Both are mature systems with ecosystems Hydra does not try to match; the comparison is
+about the specific problems in this brief: <b>jurisdiction, regional failure and recovery</b>.</p>
+</div>
+
+<!-- ============ ARCHITECTURE ============ -->
+<div class="section">
+<h2>2. Architecture in one page</h2>
+<div class="fig">
+<svg viewBox="0 0 720 330" width="100%">
+  <defs><marker id="ar" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#4b3fc4"/></marker></defs>
+  <!-- regions -->
+  <g>
+    <rect x="20" y="20" width="200" height="150" rx="8" fill="#eef4fc" stroke="#2a78d6"/>
+    <text x="32" y="42" font-size="14" font-weight="700" fill="#2a78d6">IN</text>
+    <text x="32" y="60" font-size="10" fill="#44444c">3 brokers · 3 zones · own controller</text>
+    <rect x="260" y="20" width="200" height="150" rx="8" fill="#fcf0ea" stroke="#d95926"/>
+    <text x="272" y="42" font-size="14" font-weight="700" fill="#d95926">EU</text>
+    <text x="272" y="60" font-size="10" fill="#44444c">3 brokers · 3 zones · own controller</text>
+    <rect x="500" y="20" width="200" height="150" rx="8" fill="#eaf6f1" stroke="#1b9e70"/>
+    <text x="512" y="42" font-size="14" font-weight="700" fill="#1b9e70">US</text>
+    <text x="512" y="60" font-size="10" fill="#44444c">3 brokers · 3 zones · own controller</text>
+  </g>
+  <g font-size="10">
+    <g transform="translate(32,72)"><rect width="52" height="34" rx="4" fill="#fff" stroke="#999"/><text x="8" y="21">in-1</text></g>
+    <g transform="translate(94,72)"><rect width="52" height="34" rx="4" fill="#fff" stroke="#999"/><text x="8" y="21">in-2</text></g>
+    <g transform="translate(156,72)"><rect width="52" height="34" rx="4" fill="#fff" stroke="#999"/><text x="8" y="21">in-3</text></g>
+    <g transform="translate(272,72)"><rect width="52" height="34" rx="4" fill="#fff" stroke="#999"/><text x="8" y="21">eu-1</text></g>
+    <g transform="translate(334,72)"><rect width="52" height="34" rx="4" fill="#fff" stroke="#999"/><text x="8" y="21">eu-2</text></g>
+    <g transform="translate(396,72)"><rect width="52" height="34" rx="4" fill="#fff" stroke="#999"/><text x="8" y="21">eu-3</text></g>
+    <g transform="translate(512,72)"><rect width="52" height="34" rx="4" fill="#fff" stroke="#999"/><text x="8" y="21">us-1</text></g>
+    <g transform="translate(574,72)"><rect width="52" height="34" rx="4" fill="#fff" stroke="#999"/><text x="8" y="21">us-2</text></g>
+    <g transform="translate(636,72)"><rect width="52" height="34" rx="4" fill="#fff" stroke="#999"/><text x="8" y="21">us-3</text></g>
+    <text x="32" y="126" fill="#44444c">resident topics: 2-of-3 acks</text>
+    <text x="32" y="142" fill="#44444c">inside the region only</text>
+    <text x="272" y="126" fill="#44444c">resident topics never</text>
+    <text x="272" y="142" fill="#44444c">leave their region</text>
+    <text x="512" y="126" fill="#44444c">transit-only classes are</text>
+    <text x="512" y="142" fill="#44444c">proxied, never stored</text>
+  </g>
+  <line x1="220" y1="95" x2="260" y2="95" stroke="#4b3fc4" stroke-width="2" marker-end="url(#ar)"/>
+  <line x1="460" y1="95" x2="500" y2="95" stroke="#4b3fc4" stroke-width="2" marker-end="url(#ar)"/>
+  <path d="M120,170 C120,210 600,210 600,170" fill="none" stroke="#4b3fc4" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#ar)"/>
+  <text x="250" y="222" font-size="10" fill="#4b3fc4">global / policy topics: one replica per allowed region, cross-region quorum, self-elected leader</text>
+  <!-- layers -->
+  <g font-size="10.5">
+    <rect x="20" y="240" width="680" height="80" rx="6" fill="#f4f3f8" stroke="#dcdbe2"/>
+    <text x="32" y="258" font-weight="700">Inside every broker</text>
+    <text x="32" y="276">HTTP/JSON API → residency guard (policy engine, per-hop checks, decision trail) → partition replicas (epochs, HW, fencing)</text>
+    <text x="32" y="292">→ segmented log files (CRC framed) · geo router (RTT probes, relays, link scheduler) · forecaster · checkpoint state machine</text>
+    <text x="32" y="308">→ signed manifests · Prometheus metrics · compliance evidence · admin API used by the dashboard and chaos harness</text>
+  </g>
+</svg>
+<div class="cap">Figure 1. Three independent regions on one laptop (configurable). Each region elects its own controller with
+majority-granted leases; no global controller exists, so no single region's failure can freeze another.</div>
+</div>
+<p><b>Two kinds of topic.</b> A <i>resident</i> topic (<code>residency: IN</code>) lives on three brokers in three zones of one
+region and commits on 2 of 3. A <i>cross-region</i> topic (<code>global</code> or a <code>policy:&lt;class&gt;</code> spanning regions)
+has one replica per allowed region and commits on a majority of regions, with a leader elected among the replicas
+themselves (pre-vote + check-quorum), so it survives any single region's loss without a global coordinator.</p>
+<p><b>Everything is config-driven.</b> Regions, brokers, zones and addresses come from <code>configs/cluster.local.json</code>;
+the same binaries run as local processes (the demo) or in containers.</p>
+<p><b>Constraints honoured.</b> No existing broker or queue, no embedded database: the log is plain segment files written by
+our own code; only the Go standard library is used (HTTP, JSON, Ed25519, SHA-256, CRC32-C).</p>
+
+<h3>3. Comparison at a glance</h3>
+<table>
+<tr><th>Capability</th><th>Kafka (standard)</th><th>Pulsar (standard)</th><th>Hydra Stream</th></tr>
+<tr><td>Data residency unit</td><td>whole cluster (mirror selected topics)</td><td>namespace/topic allowed-cluster list</td><td class="yes">per topic and per message, storage ≠ transit</td></tr>
+<tr><td>Signed, versioned, fail-closed policy</td><td class="no">no</td><td class="no">no</td><td class="yes">Ed25519, no rollback, expiry</td></tr>
+<tr><td>Per-hop jurisdiction audit record</td><td class="no">no</td><td class="no">no</td><td class="yes">every deny + sampled allows, signed evidence</td></tr>
+<tr><td>Region failure isolation</td><td class="part">per-cluster; stretch clusters share a controller quorum</td><td class="part">per-cluster; shared config store for geo</td><td class="yes">independent regions; global data by region quorum</td></tr>
+<tr><td>Replication bandwidth control</td><td class="part">static throttle rate</td><td class="part">static dispatch-rate limits</td><td class="yes">adaptive (AIMD on live delay) + urgent overdraft</td></tr>
+<tr><td>Consumer progress after failover</td><td class="part">single committed offset</td><td class="part">individual acks (shared subs), cursor not owner-fenced</td><td class="yes">ranges + in-flight + owner epoch fencing</td></tr>
+<tr><td>Recovery forecasts</td><td class="no">metrics only</td><td class="no">metrics only</td><td class="yes">time-to-clear with range, time-to-full, advice</td></tr>
+<tr><td>What-if simulator</td><td class="no">no</td><td class="no">no</td><td class="yes">same code as brokers, validated 18/18</td></tr>
+<tr><td>Cross-region dedup</td><td class="no">no</td><td class="no">no</td><td class="yes">hash references, full payloads on disk</td></tr>
+<tr><td>Per-message durability</td><td class="part">per producer (acks)</td><td class="part">per topic/namespace</td><td class="yes">per request, with policy floor</td></tr>
+<tr><td>Idempotent producer</td><td class="yes">yes</td><td class="yes">yes (dedup)</td><td class="yes">yes (on par)</td></tr>
+<tr><td>Ecosystem, connectors, scale</td><td class="yes">very large</td><td class="yes">large</td><td class="no">prototype</td></tr>
+</table>
+</div>
+
+<!-- ============ PART A ============ -->
+<div class="section">
+<h2>Part A — The core platform</h2>
+<p class="small">These are the foundations that the seven improvements build on. Each is summarised in the same
+structure: what it does · how it works · why it matters / how it compares · evidence.</p>
+
+<h3>A1. Segmented append-only log — no database</h3>
+<p><b>What.</b> Every partition is a directory of segment files; records are appended and never rewritten.</p>
+<p><b>How.</b> Each record is framed with its length and a CRC32-C checksum and carries offset, leader epoch, timestamp,
+flags, producer id and sequence, headers, key and value. Segments roll at a configured size. On start-up the log scans the
+last segment and truncates any torn tail whose checksum fails, so a power cut never leaves a corrupt record visible.
+An in-memory index maps offsets to file positions; <code>EpochAt</code> answers "which leader wrote this offset", which
+replication uses to detect divergence.</p>
+<p><b>Why it matters.</b> The brief banned embedded databases; plain files also make the residency audit trivial — data is
+exactly where its files are.</p>
+<p><b>Evidence.</b> Hard kill during 400,000-message writes: every message and offset intact. Single broker: ~700k msg/s produce on loopback.</p>
+
+<h3>A2. In-region replication with lease + epoch fencing</h3>
+<p><b>What.</b> A region's controller is elected without Raft libraries; partition leaders fail over in well under a second
+and a stale leader that comes back can never acknowledge a write.</p>
+<p><b>How.</b> A candidate becomes controller only with <b>leases granted by a majority</b> of the region's brokers; promises are
+persisted so a restarted broker can't grant twice. Every metadata change, leader election, write and replication request
+carries an <b>epoch</b>; anything with an older epoch is rejected. Leaders push batches with the previous offset and epoch;
+followers truncate to the high watermark on divergence. Before electing a new leader, the controller fences the old one.</p>
+<p><b>Why it matters.</b> The controller is not a single point of failure (any majority can elect one), and the classic
+split-brain — an old leader paused by GC returning and accepting writes — is closed by epochs, not clocks.</p>
+<p><b>Evidence.</b> Tests for controller crash, leader crash and a stale leader after a pause, each run ×8: new leader in
+175–606 ms, 0 acknowledged messages lost, stale leader never acks and is fenced on return.</p>
+<div class="box warn"><b class="lbl">Clock assumption</b>Leases depend on clocks advancing at roughly the same rate (not on synchronised time).
+Safety does not depend on clocks: epochs fence writes even if a lease is wrongly believed valid.</div>
+
+<h3>A3. Independent regions and cross-region quorum</h3>
+<p><b>What.</b> Each region runs its own control plane. Global topics keep accepting writes when any one region dies or is cut off.</p>
+<p><b>How.</b> A cross-region partition has one replica per allowed region. Its replicas elect a leader among themselves with
+Raft-style votes, <b>pre-vote</b> (an isolated replica can't inflate epochs) and <b>check-quorum</b> (a leader that loses touch
+with a majority steps down). Writes commit when a majority of regions has them.</p>
+<p><b>Compared with Kafka/Pulsar.</b> A stretched Kafka cluster shares one controller quorum across regions; Pulsar geo-replication
+is asynchronous between clusters (a region's unreplicated writes are at risk when it fails). Hydra gives global topics
+synchronous majority durability <i>and</i> keeps every region's local data fully independent.</p>
+<p><b>Evidence.</b> Region crash ×5: global leader re-elected in 0.32–0.45 s, surviving resident topics stall ≤ 42 ms, 0 loss.
+Region isolation ×5: the isolated region keeps serving its own data (1–2 ms writes), and global writes there fail in ~1–2 ms
+with <code>REGION_UNAVAILABLE</code> instead of hanging.</p>
+
+<h3>A4. Latency-aware relay routing</h3>
+<p><b>What.</b> When a direct inter-region link gets slow, global traffic automatically goes through a third region.</p>
+<p><b>How.</b> Brokers probe every region continuously and keep an EWMA of round-trip time. A relay is chosen when it is at least
+30% faster <i>and</i> saves at least 10 ms, with hysteresis so routes don't flap. The rule is one pure function,
+<code>geo.ChooseRelay</code>, shared with the simulator. Relays are only used through regions the data's policy allows to
+transit, at most 2 hops, with loop detection.</p>
+<p><b>Evidence.</b> IN↔EU slowed by 150 ms each way (301 ms RTT): rerouted via US within 135–180 ms; fetch p50 1.1 ms before vs 1.3 ms during the fault.</p>
+</div>
+
+<div class="section">
+<h3>A5. Residency guard on every data path</h3>
+<p><b>What.</b> A single guard is consulted before data is stored, replicated, forwarded, proxied or relayed — including when
+configuration is wrong.</p>
+<p><b>How.</b> Placement only considers eligible brokers; the leader checks the follower's region before sending; the follower
+checks again before accepting; relays check transit and the destination's storage permission. A test deliberately puts an EU
+broker into India's peer list: India's data is still never placed on, replicated to, relayed through or accepted by it.</p>
+<p><b>Why it matters.</b> Defence in depth: a single misconfiguration can't leak data, because the receiving side refuses too.</p>
+
+<h3>A6. Signed segment manifests and residency_audit</h3>
+<p><b>What.</b> An offline auditor proves where every byte lives.</p>
+<p><b>How.</b> Each broker signs (Ed25519) a manifest of every segment it stores. <code>residency_audit</code> scans each data
+directory, verifies each live broker's manifest against pinned keys, and judges each topic against its residency or signed
+policy class. If it can't verify a policy it <b>fails</b> rather than passing silently. Exit code 1 on any violation.</p>
+<p><b>Evidence.</b> Clean cluster: PASS, 9/9 manifests verified. India's data copied onto an EU broker: FAIL with 6 violations.
+Audit every 5 s during all chaos faults: PASS before/during/after in all 6 scenarios.</p>
+
+<h3>A7. Fast, specific errors</h3>
+<p>Clients never wait on a timeout to learn the obvious. <code>WRONG_REGION</code> (with the brokers to use),
+<code>REGION_UNAVAILABLE</code> with a reason (<code>region_unreachable</code>, <code>region_isolated</code>),
+<code>NOT_LEADER</code> with a hint, <code>STALE_EPOCH</code>, <code>NOT_ENOUGH_REPLICAS</code>,
+<code>RESIDENCY_VIOLATION</code> with a reason, <code>POLICY_UNAVAILABLE</code>. In chaos runs the slowest error answer was 42 ms;
+cross-region "region down" answers arrive in ~55 ms.</p>
+
+<h3>A8. Idempotent producer</h3>
+<p>Producer id + per-partition sequence numbers; the leader remembers the last 8 batches per producer (rebuilt from the log after
+restart), so retries after a failover never duplicate. On par with Kafka's and Pulsar's idempotence; required for the
+"0 duplicates" result below.</p>
+
+<h3>A9. Chaos harness and correctness checker</h3>
+<p><b>What.</b> <code>hydra-chaos</code> starts all 9 brokers as real processes, runs six streams of load, injects a fault, heals it,
+then verifies every acknowledged message: present, exactly once, in order — and runs the residency audit before, during and after.</p>
+<p><b>Scenarios.</b> baseline, kill-broker (the leader), kill-zone (the controller's zone), kill-region, isolate-region, slow-link.</p>
+<table>
+<tr><th>Scenario</th><th class="n">Acked</th><th class="n">Lost</th><th class="n">Dups</th><th class="n">Order</th><th class="n">Max stall surviving</th><th class="n">Max stall global</th><th>Audit</th></tr>
+<tr><td>baseline</td><td class="n">148,560</td><td class="n">0</td><td class="n">0</td><td class="n">0</td><td class="n">14 ms</td><td class="n">13 ms</td><td>PASS ×3</td></tr>
+<tr><td>kill-broker</td><td class="n">146,820</td><td class="n">0</td><td class="n">0</td><td class="n">0</td><td class="n">15 ms</td><td class="n">75 ms</td><td>PASS ×3</td></tr>
+<tr><td>kill-zone</td><td class="n">149,140</td><td class="n">0</td><td class="n">0</td><td class="n">0</td><td class="n">16 ms</td><td class="n">751 ms</td><td>PASS ×3</td></tr>
+<tr><td>kill-region</td><td class="n">149,660</td><td class="n">0</td><td class="n">0</td><td class="n">0</td><td class="n">16 ms</td><td class="n">195 ms</td><td>PASS ×3</td></tr>
+<tr><td>isolate-region</td><td class="n">153,580</td><td class="n">0</td><td class="n">0</td><td class="n">0</td><td class="n">15 ms</td><td class="n">156 ms</td><td>PASS ×3</td></tr>
+<tr><td>slow-link</td><td class="n">155,860</td><td class="n">0</td><td class="n">0</td><td class="n">0</td><td class="n">14 ms</td><td class="n">308 ms</td><td>PASS ×3</td></tr>
+</table>
+<p class="small">Run <code>results/chaos-20261031-183900.md</code>, with signed policies installed. In kill-region, India's own stream waits
+for India to return (8 s) by design — its data may not fail over abroad — while its clients get errors within 42 ms.
+Surviving regions never stalled more than 16 ms: well inside the 1 s target.</p>
+
+<h3>A10. One-command demo and dashboard</h3>
+<p><code>.\scripts\hydra.ps1 demo</code> builds everything, signs the policies, starts 9 brokers and load, and opens a dashboard with the
+live region map (RTTs, relays, cut links), throughput, leaders, audit status, events, and buttons to kill/restart/isolate regions
+and brokers, slow or cap links, run the audit — plus panels for every Part B feature (policy decisions, link scheduler,
+recovery forecast, what-if simulator).</p>
+</div>
+
+<!-- ============ PART B ============ -->
+<div class="section">
+<h2>Part B — The seven improvements</h2>
+
+<h3>B1. Granular failover checkpoints</h3>
+<div class="box"><b class="lbl">Problem</b>Parallel consumers finish messages out of order. A single committed offset can only advance to the oldest
+unfinished message, so when a consumer crashes, every message finished above it is processed again — and a paused
+"zombie" consumer may later overwrite the new owner's progress.</div>
+<p><b>What it does.</b> Records exactly which messages are done, so a takeover redoes only work that was genuinely in flight,
+and guarantees only the current owner can move a checkpoint.</p>
+<p><b>How it works.</b></p>
+<ul>
+  <li>A checkpoint holds a <b>low watermark</b> (everything below is done), the <b>acknowledged ranges</b> above it
+    (<code>RangeSet</code>: sorted, merged [from, to) ranges, capped at 4096), the <b>in-flight</b> offsets, and an <b>owner epoch</b>.</li>
+  <li><code>POST /v1/groups/{g}/claim</code> makes the caller owner and bumps the epoch. <code>commit</code> is a
+    <b>compare-and-append</b> on the partition leader: it succeeds only if the epoch still matches, otherwise
+    <code>STALE_EPOCH</code> (<code>stale_owner</code>). A checkpoint can't move backwards (<code>checkpoint_regression</code>).</li>
+  <li>Checkpoints are records in an internal topic with the <b>same residency as the data</b> (<code>__cp.&lt;residency&gt;</code>),
+    replicated like any partition and folded into current state by a replicated state machine on every replica. A failover of the
+    checkpoint store itself loses nothing, and progress metadata never leaves the data's jurisdiction.</li>
+</ul>
+<div class="fig">
+<svg viewBox="0 0 700 120" width="100%">
+  <text x="0" y="14" font-size="11" font-weight="600">Offsets 100–122 after a crash (green = finished, amber = in flight, grey = not started)</text>
+  <g transform="translate(0,24)" font-size="9">
+    <rect x="0" y="0" width="20" height="22" fill="#0b8a0b"/><rect x="21" y="0" width="20" height="22" fill="#0b8a0b"/><rect x="42" y="0" width="20" height="22" fill="#0b8a0b"/>
+    <rect x="63" y="0" width="20" height="22" fill="#b07800"/>
+    <rect x="84" y="0" width="20" height="22" fill="#0b8a0b"/><rect x="105" y="0" width="20" height="22" fill="#0b8a0b"/><rect x="126" y="0" width="20" height="22" fill="#0b8a0b"/><rect x="147" y="0" width="20" height="22" fill="#0b8a0b"/>
+    <rect x="168" y="0" width="20" height="22" fill="#b07800"/>
+    <rect x="189" y="0" width="20" height="22" fill="#0b8a0b"/><rect x="210" y="0" width="20" height="22" fill="#0b8a0b"/><rect x="231" y="0" width="20" height="22" fill="#0b8a0b"/><rect x="252" y="0" width="20" height="22" fill="#0b8a0b"/><rect x="273" y="0" width="20" height="22" fill="#0b8a0b"/><rect x="294" y="0" width="20" height="22" fill="#0b8a0b"/>
+    <rect x="315" y="0" width="20" height="22" fill="#b07800"/>
+    <rect x="336" y="0" width="20" height="22" fill="#0b8a0b"/><rect x="357" y="0" width="20" height="22" fill="#0b8a0b"/><rect x="378" y="0" width="20" height="22" fill="#0b8a0b"/>
+    <rect x="399" y="0" width="20" height="22" fill="#ccc"/><rect x="420" y="0" width="20" height="22" fill="#ccc"/><rect x="441" y="0" width="20" height="22" fill="#ccc"/><rect x="462" y="0" width="20" height="22" fill="#ccc"/>
+    <text x="0" y="40">100</text><text x="63" y="40">103</text><text x="168" y="40">108</text><text x="315" y="40">115</text>
+  </g>
+  <text x="0" y="86" font-size="10.5"><tspan font-weight="600" fill="#c03030">Offset-only:</tspan> committed offset = 103 → resume at 103 → the 13 finished messages above 103 are processed again.</text>
+  <text x="0" y="104" font-size="10.5"><tspan font-weight="600" fill="#0b8a0b">Granular:</tspan> low=103, acked=[104,108) [109,115) [116,119), in-flight={103,108,115} → only the 3 in-flight messages are redone.</text>
+</svg>
+</div>
+<p><b>Why it is better.</b> Kafka's consumer groups store one committed offset, so out-of-order completion always turns into
+redelivery. Pulsar can track individual acknowledgements for shared subscriptions, but its cursor is not fenced by an owner epoch
+against a paused consumer, and it isn't scoped to the data's jurisdiction. Hydra combines exact progress, zombie fencing and
+residency in one mechanism.</p>
+<p><b>Evidence.</b></p>
+<table>
+<tr><th>Experiment</th><th>Offset-only</th><th>Granular (Hydra)</th></tr>
+<tr><td>Real cluster test (<code>TestGranularCheckpointsAndFencing</code>): messages redelivered after takeover</td><td class="n">100</td><td class="n">1</td></tr>
+<tr><td><code>hydra-bench</code>: 20k messages, 16 workers, heavy-tailed processing, 400 random crashes — duplicates, median</td><td class="n">587</td><td class="n">67</td></tr>
+<tr><td>— p95</td><td class="n">973</td><td class="n">145</td></tr>
+<tr><td>Checkpoint size (median)</td><td class="n">1 offset</td><td class="n">9 ranges</td></tr>
+<tr><td>Zombie consumer commits after takeover</td><td>accepted (overwrites)</td><td><code>STALE_EPOCH</code> (refused)</td></tr>
+</table>
+<p class="small">Limitation: no automatic partition assignment / rebalancing yet — a consumer claims a partition explicitly.</p>
+</div>
+
+<div class="section">
+<h3>B2. Adaptive replication bandwidth controller</h3>
+<div class="box"><b class="lbl">Problem</b>When a region comes back after an outage, its replicas pull a large backlog over the same inter-region link that live
+traffic needs. A plain replicator (FIFO) lets the catch-up flood delay live writes; a static rate limit is either too low
+(recovery takes forever) or too high (live traffic suffers), and is wrong as soon as the link changes.</div>
+<p><b>What it does.</b> Shares each inter-region link between traffic classes so live traffic stays fast, urgent control traffic
+is never delayed, and recovery uses everything that is left — automatically adjusting when capacity or load changes.</p>
+<p><b>How it works.</b></p>
+<ul>
+  <li><b>Token bucket</b> per directed link enforces capacity; large sends may go into debt and are repaid (no fragmentation).</li>
+  <li><b>Start-time fair queuing</b> across classes: control (strict priority), urgent (weight 8), live (4), recovery (adaptive).
+    Each class advances a virtual clock by bytes/weight; the lowest clock sends next. Work-conserving: idle share flows to others.</li>
+  <li><b>AIMD controller</b> every 100 ms on recovery's weight, driven by the smoothed p90 queueing delay of live traffic:
+    multiply by 0.7 when live waits longer than the 20 ms target; add 0.25 when it waits under half the target and a backlog exists.
+    Bounded to [0.25, 6] so recovery is never starved and never dominates.</li>
+  <li><b>Priority overdraft</b>: small control/urgent sends (≤ 4 KB) may overdraw the bucket from a separate budget (5% of capacity), so
+    a 1 KB vote never waits behind a 128 KB catch-up chunk's debt. Found by our own benchmark (14% deadline misses before the fix).</li>
+  <li>Batches are classified at the source: recovery when a follower is more than one batch behind, live otherwise; catch-up batches
+    grow to 256 KB on cross-region links for efficiency.</li>
+</ul>
+<div class="fig">
+<svg viewBox="0 0 700 175" width="100%">
+  <text x="0" y="14" font-size="11" font-weight="600">Live traffic p95 queueing delay during recovery (ms, lower is better)</text>
+  <g font-size="10">
+    <text x="0" y="42">FIFO</text><rect x="150" y="30" width="480" height="18" fill="#c03030"/><text x="636" y="44">632</text>
+    <text x="0" y="68">Fixed 50% share</text><rect x="150" y="56" width="476" height="18" fill="#b07800"/><text x="632" y="70">627</text>
+    <text x="0" y="94">Adaptive (Hydra)</text><rect x="150" y="82" width="43" height="18" fill="#0b8a0b"/><text x="199" y="96">57</text>
+  </g>
+  <text x="0" y="126" font-size="11" font-weight="600">Urgent sends over their 25 ms deadline (%)</text>
+  <g font-size="10">
+    <text x="0" y="148">FIFO 100% · Fixed 70% · Adaptive <tspan font-weight="700" fill="#0b8a0b">0%</tspan></text>
+  </g>
+</svg>
+<div class="cap">Figure 2. <code>hydra-bench bandwidth</code>: link 4 MB/s falling to 2.4 MB/s mid-run, 1.6 MB/s live traffic, 1 KB urgent
+every 50 ms, 10 MB recovery backlog with 4 senders; median of 3 runs.</div>
+</div>
+<table>
+<tr><th>Mode</th><th class="n">live p50</th><th class="n">live p95</th><th class="n">live p99</th><th class="n">urgent late</th><th class="n">backlog cleared</th><th class="n">utilization</th></tr>
+<tr><td>FIFO (plain replicator)</td><td class="n">545 ms</td><td class="n">632 ms</td><td class="n">644 ms</td><td class="n">100%</td><td class="n">6.9 s</td><td class="n">≈100%</td></tr>
+<tr><td>Fixed 50% recovery share (static throttle)</td><td class="n">460 ms</td><td class="n">627 ms</td><td class="n">640 ms</td><td class="n">70%</td><td class="n">7.9 s</td><td class="n">97%</td></tr>
+<tr><td><b>Adaptive (Hydra)</b></td><td class="n"><b>30 ms</b></td><td class="n"><b>57 ms</b></td><td class="n"><b>95 ms</b></td><td class="n"><b>0%</b></td><td class="n">8.0 s</td><td class="n">≈100%</td></tr>
+</table>
+<p><b>Why it is better.</b> Kafka's replication throttle and Pulsar's replicator dispatch-rate limits are static numbers an operator
+must pick in advance. Hydra's controller measures the effect on live traffic and adjusts every 100 ms, so it stays right when the link
+degrades (as in the benchmark, where capacity drops 40% mid-run).</p>
+<div class="box warn"><b class="lbl">Honest trade-off</b>Adaptive clears the backlog about 1 s later than FIFO (8.0 s vs 6.9 s) because recovery yields to live
+traffic. That is the intended trade: live users see 11× lower p95 delay; catch-up finishes slightly later. Capacity is
+configured per link (dashboard "Cap links" or admin API); bandwidth is not estimated automatically.</div>
+</div>
+
+<div class="section">
+<h3>B3. Message-level jurisdiction enforcement</h3>
+<div class="box"><b class="lbl">Problem</b>Data-protection rules distinguish <i>where data is stored</i> from <i>where it may pass through</i>, differ per
+data class, change over time, and must be provable. Cluster-level replication lists can express none of that.</div>
+<p><b>What it does.</b> Each topic — and each message — carries a policy class that says where it may be stored, where it may
+transit, and the minimum durability. Every broker enforces it at every hop, records the decision, and refuses to move data
+when it can't evaluate the policy.</p>
+<p><b>How it works.</b></p>
+<ul>
+  <li><b>Policies</b> (example classes in the demo): <code>public</code> (anywhere), <code>telemetry</code> (anywhere, acks=leader),
+    <code>pii-in</code> (India only), <code>eu-personal</code> (stored in EU, may <i>transit</i> US, never stored there),
+    <code>financial</code> (stored in IN and EU, never stored in or routed through US, acks=all).</li>
+  <li><b>Signed documents.</b> The administrator signs a versioned document with an expiry (Ed25519). Brokers verify the signature,
+    refuse older versions (no rollback attack), reject unknown regions and duplicate classes. Missing, unsigned or expired ⇒
+    <b>fail closed</b>: <code>POLICY_UNAVAILABLE</code>, no data moves.</li>
+  <li><b>Producers can only narrow.</b> A per-message class header is intersected with the topic's policy: storage ∩ storage,
+    transit ∩ transit, the stricter durability wins. A producer-requested relay must be a permitted transit region.</li>
+  <li><b>Every hop</b> runs the same guard: entry, forward, proxy, relay, replicate-send, replicate-accept, store. Relays are capped at 2 hops
+    with loop detection. Regions that may only transit a class <b>proxy</b> requests to a storage region without writing to disk; regions
+    that may not even transit it refuse at entry and redirect the client.</li>
+  <li><b>Placement</b> puts one replica in each permitted storage region (topped up to three), so <code>financial</code> survives
+    losing either IN or EU while never touching US disks.</li>
+  <li><b>Decision trail</b>: every deny (and sampled allows) is appended to <code>decisions.log</code> with broker, topic, hop, peer region,
+    policy and version, reason and evaluation time; <code>/admin/v1/compliance</code> returns a broker-signed evidence bundle; the
+    residency audit judges <code>policy:&lt;class&gt;</code> data against the signed document.</li>
+</ul>
+<table>
+<tr><th>Situation (live demo)</th><th>What Hydra does</th></tr>
+<tr><td>US client writes <code>payments</code> (financial)</td><td>Refused at entry: <code>WRONG_REGION</code> → IN/EU brokers; deny recorded (<code>transit_not_permitted</code>)</td></tr>
+<tr><td>US client writes <code>eu-profiles</code> (eu-personal)</td><td>Proxied to EU in memory; never written to US disks</td></tr>
+<tr><td>IN client writes <code>eu-profiles</code></td><td>Refused at entry (IN may not even carry it); deny recorded</td></tr>
+<tr><td>Producer asks to route financial data via US</td><td><code>RESIDENCY_VIOLATION</code> (<code>route_not_permitted</code>)</td></tr>
+<tr><td>Producer sends <code>acks=leader</code> on financial</td><td>Raised to <code>acks=all</code>; response states the mode applied</td></tr>
+<tr><td>Policy document expires or is tampered with</td><td>Fail closed: <code>POLICY_UNAVAILABLE</code>; audit also fails closed</td></tr>
+</table>
+<p><b>Why it is better.</b> Pulsar's geo-replication restricts a namespace or topic to a list of clusters; Kafka mirrors whole topics
+between clusters. Neither separates storage from transit, lets a single message narrow its rules, verifies a signed policy,
+fails closed, or records each hop's decision. Hydra makes residency an enforced and auditable property of each message.</p>
+<p><b>Cost.</b> Per-hop policy check (<code>hydra-bench policy</code>): 0.1 µs (built-in residency), 0.3 µs (signed class),
+0.8 µs (with per-message narrowing), 1.4 µs when an audit record is written — per batch, against 80–220 ms inter-region round trips.</p>
+<p><b>Evidence.</b> <code>TestJurisdictionPolicies</code> (fail closed without a document; placement avoids US; acks floor; producer route
+refused; transit-only proxying; narrowing); chaos suite and dashboard audit: PASS with policy topics live.</p>
+</div>
+
+<div class="section">
+<h3>B4. Predictive backlog and storage forecasts</h3>
+<div class="box"><b class="lbl">Problem</b>During an incident, operators need to know <i>when</i> things will be back to normal and whether something
+else (disk) will run out first — not just a lag number.</div>
+<p><b>What it does.</b> Every broker estimates, for each lagging replica and consumer group, when its backlog will clear (with a
+low/high range), when its storage will fill, and turns these into plain recommendations.</p>
+<p><b>How it works.</b> Every 500 ms the forecaster samples follower lag, consumer-group lag and data-directory size. Arrival and
+drain rates are tracked as exponentially weighted moving averages (α = 0.2) with their variance; time-to-clear =
+backlog / (drain − arrival), with a range from ±1 standard deviation of the rates; time-to-full uses growth against the
+configured disk budget. Rules then produce advice, e.g. <i>"storage fills in ~4m, before the replication backlog clears (~9m):
+prioritise recovery bandwidth and throttle non-urgent producers now"</i>, or <i>"follower is falling behind (in &gt; drained)"</i>.
+Shown at <code>/admin/v1/forecast</code> and on the dashboard; the same math powers the simulator.</p>
+<p><b>Why it is better.</b> Kafka and Pulsar export lag metrics; turning them into an ETA is left to external tooling. Hydra gives an
+explainable estimate and a recommended action where the data is, using math simple enough to verify by hand.</p>
+<p class="small">Limitation: assumes rates stay near recent averages; a step change takes a few seconds to be reflected.</p>
+
+<h3>B5. Pre-deployment failure and policy simulator</h3>
+<div class="box"><b class="lbl">Problem</b>"What happens if we lose a region / change this policy / traffic grows 5×?" is usually answered by a production incident.
+A simulator that re-implements the system is only as good as its second copy of the rules.</div>
+<p><b>What it does.</b> Predicts, before anything changes: which partitions stay writable and from which client regions, which paths
+traffic will take and which data classes may not use them, where backlog builds and how long catch-up takes, how loaded each link
+is, and which stored data a proposed policy change would leave in a forbidden place.</p>
+<p><b>How it works.</b> It calls the <b>brokers' own code</b>: <code>placement</code> (where replicas go), <code>placement.Quorum</code> and the policy's
+<code>min_acks</code> (can it commit?), policy <code>Resolve</code> (who may store/transit), <code>geo.ChooseRelay</code> (path choice, extracted from the
+router so both use one function) and <code>forecast.TimeToClear</code>. Proposed policy changes are evaluated on an unsigned copy
+(<code>policy.ForSimulation</code>) that brokers never accept. Available as <code>hydra-sim</code> (offline, or <code>-broker</code> to read live
+topics and measured RTTs) and as the dashboard's "What-if" panel.</p>
+<p><b>Scenarios</b> (the guide's six, all supported): region offline · link 10× slower · region removed from allowed transit ·
+5× traffic · destination storage full · two regions recover; plus isolation, link cut and storage removal.</p>
+<table>
+<tr><th>What-if</th><th>Prediction (demo topology)</th></tr>
+<tr><td>IN goes offline</td><td>13/16 writable; IN-resident and pii-in stop (by law); 9 IN replicas to catch up, ~4 s</td></tr>
+<tr><td>IN↔EU 10× slower</td><td>IN↔EU relayed via US (300 vs 1200 ms) — but <i>not</i> for financial, which keeps the slow direct path</td></tr>
+<tr><td>Remove US from eu-personal transit</td><td>"clients in US would get RESIDENCY_VIOLATION" — fix before signing</td></tr>
+<tr><td>Remove EU from financial storage</td><td>Lists every EU replica that would hold now-forbidden data</td></tr>
+<tr><td>5× traffic + US down, 20 Mbit/s links</td><td>EU↔IN replication over capacity (160%): followers will fall behind; US needs ~2 min to catch up</td></tr>
+<tr><td>EU and US recover after 5 min</td><td>7 replicas each behind, 180 MB, ~32 s catch-up while sharing source links</td></tr>
+</table>
+<p><b>Validated against reality.</b> <code>TestSimulatorMatchesCluster</code> builds a real 9-broker cluster with resident, global and policy topics,
+compares predicted with actual placement (identical for every partition), kills India, and checks every (partition, client region)
+pair: <b>18/18 predictions matched</b>. The first run disagreed on 2 — the simulator had ignored <code>financial</code>'s acks=all
+floor; the test exposed it and the simulator was fixed. That is the point of validating a model against the system.</p>
+<p><b>Why it is better.</b> Neither Kafka nor Pulsar ships a what-if tool for availability, routing and data-residency effects.</p>
+<p class="small">Limitation: backlog math is steady-state (average message size, no TCP dynamics).</p>
+</div>
+
+<div class="section">
+<h3>B6. Cross-region payload deduplication (stretch goal — implemented)</h3>
+<div class="box"><b class="lbl">Problem</b>Many workloads resend identical large payloads (documents, images, configuration blobs). Sending the same bytes
+across expensive inter-region links again and again wastes the scarcest resource during recovery.</div>
+<p><b>What it does.</b> On cross-region replication, a large value the follower already has is sent as a 32-byte hash reference.</p>
+<p><b>How it works.</b> For values ≥ 1 KB the leader remembers which hashes each follower is known to hold (bounded, 20k per follower,
+FIFO). Known values are sent as their SHA-256 (<code>Ref</code>) instead of the bytes. The follower looks the hash up in an index of its
+own log, reads that record back, <b>verifies the hash</b>, and appends the full value. If it can't resolve a reference (evicted,
+truncated, never seen) it answers <code>NeedFull</code> and the leader resends that batch in full — correctness never depends on the cache.</p>
+<p><b>Design choices.</b> Logs always hold complete payloads (no content-addressed blob store), so crash recovery, truncation, audit and
+retention never depend on dedup. References are scoped to one partition, so one tenant can never reference — or probe for — another's data.
+<code>-no-dedup</code> turns it off.</p>
+<p><b>Evidence.</b> <code>TestCrossRegionDedup</code>: 78 records sent as references, <b>655,200 bytes not sent</b> across regions, logs identical
+on both sides. Benefit is workload-dependent: zero for unique payloads (cost: one SHA-256 per large value).</p>
+<p><b>Why it is better.</b> Kafka and Pulsar compress batches but do not avoid re-sending payloads the remote side already stores.</p>
+
+<h3>B7. Per-message delivery and durability modes</h3>
+<p><b>What it does.</b> Each produce request chooses its durability and its traffic class, within the floor its policy sets.</p>
+<p><b>How it works.</b></p>
+<ul>
+  <li><code>acks=leader</code> — acknowledged once the leader has it (lowest latency; the last batch can be lost if the leader dies).</li>
+  <li><code>acks=quorum</code> (default) — a majority of replicas (in-region: 2 of 3 zones; cross-region: a majority of regions).</li>
+  <li><code>acks=all</code> — every replica; writes stop (with explicit errors) while any replica is unreachable.</li>
+  <li>A policy's <code>min_acks</code> is a floor: <code>financial</code> is always <code>all</code>, <code>telemetry</code> may use <code>leader</code>.
+    The response reports the mode actually applied.</li>
+  <li>Class hints (<code>urgent</code>, <code>live</code>, <code>recovery</code>) feed the link scheduler (B2).</li>
+</ul>
+<p><b>Why it is better.</b> Kafka sets acks per producer; Pulsar's durability is per topic/namespace. Hydra lets one producer send telemetry
+fast and payments safely on the same connection, while the compliance team's floor can't be bypassed.</p>
+<p><b>Evidence.</b> <code>TestAcksModes</code>; the simulator and the real cluster agree that <code>acks=all</code> data stops accepting writes
+when a replica's region fails — a trade-off made explicit rather than hidden.</p>
+
+<h2 style="margin-top:8mm">Part C — Extras</h2>
+<ul>
+  <li><b>Prometheus metrics</b> at <code>/metrics</code>: produced/proxied requests, policy denials, checkpoint claims/commits/fenced, per-link
+    scheduler stats, replication lag.</li>
+  <li><b>Compliance evidence</b>: <code>/admin/v1/compliance</code> returns what a broker stores, under which policy version, and its
+    jurisdiction decisions, signed with the broker's key.</li>
+  <li><b>One-command signed policies</b>: <code>hydra-policy ensure</code> creates the admin key and signs only when needed; brokers start with
+    <code>-policies</code> (signature still verified); <code>push</code> installs a new version cluster-wide.</li>
+  <li><b>Benchmarks with fair baselines</b>: <code>hydra-bench</code> (Part B numbers) and the chaos harness (Part A numbers).</li>
+</ul>
+</div>
+
+<!-- ============ RESULTS / LIMITS / REPRO ============ -->
+<div class="section">
+<h2>7. Measured results — summary</h2>
+<table>
+<tr><th>Area</th><th>Measurement</th><th>Result</th></tr>
+<tr><td>Correctness under faults</td><td>6 chaos scenarios, real processes, ~904k acked messages</td><td>0 lost · 0 duplicates · 0 order violations</td></tr>
+<tr><td>Freezing</td><td>max stall in surviving regions, any scenario</td><td>≤ 16 ms (target &lt; 1 s)</td></tr>
+<tr><td>Explicit errors</td><td>slowest error answer during faults</td><td>42 ms (target &lt; 500 ms)</td></tr>
+<tr><td>Global failover</td><td>region crash, re-election (tests ×5)</td><td>0.32–0.45 s</td></tr>
+<tr><td>Residency</td><td>audit before/during/after every fault</td><td>PASS in all 18 checks</td></tr>
+<tr><td>Bandwidth (B2)</td><td>live p95 during recovery</td><td>57 ms vs 632 ms FIFO</td></tr>
+<tr><td>Bandwidth (B2)</td><td>urgent deadline misses</td><td>0% vs 100% FIFO / 70% fixed</td></tr>
+<tr><td>Checkpoints (B1)</td><td>duplicates after crash, median / p95</td><td>67 / 145 vs 587 / 973</td></tr>
+<tr><td>Jurisdiction (B3)</td><td>policy check cost per batch</td><td>0.1–1.4 µs</td></tr>
+<tr><td>Simulator (B5)</td><td>predictions vs real cluster</td><td>placement identical; 18/18 outcomes</td></tr>
+<tr><td>Dedup (B6)</td><td>repeated-payload test</td><td>655 KB not sent cross-region</td></tr>
+<tr><td>Throughput</td><td>single broker / 3-broker region / global</td><td>~700k / ~185k / ~84k msg/s (laptop, loopback)</td></tr>
+</table>
+
+<h2 style="margin-top:6mm">8. Limitations and honest notes</h2>
+<ul>
+  <li>A prototype on one laptop over loopback; absolute throughput and latency won't transfer to WAN deployments. Inter-region delay is injected.</li>
+  <li>Baselines are modes of Hydra's code, not Kafka/Pulsar binaries (not allowed in this project).</li>
+  <li>Protocol is JSON over HTTP (simple, not the fastest); offsets index is in memory; no retention, compaction or authentication yet.</li>
+  <li>Leases assume bounded clock drift; safety relies on epochs. Policy expiry uses wall-clock time.</li>
+  <li>A global partition has one replica per region; losing a region and a broker in another region at once makes it unavailable until one returns.</li>
+  <li>A policy change doesn't migrate existing data: the simulator lists what would be stranded and the audit flags it; moving it is an operator action.</li>
+  <li>Consumer groups have no automatic rebalancing; link capacity is configured, not estimated.</li>
+  <li>The demo keeps the admin signing key in <code>configs/</code>; production would keep it offline or in an HSM.</li>
+</ul>
+
+<h2 style="margin-top:6mm">9. How to reproduce every number</h2>
+<pre>go test ./...                                     # all unit + cluster tests (incl. simulator vs cluster)
+go test ./internal/broker -run "Jurisdiction|Checkpoints|AcksModes|Dedup|Simulator" -v
+.\scripts\hydra.ps1 chaos                         # 6 scenarios, real processes → results\chaos-*.md
+.\bin\hydra-bench.exe -out results\bench.md       # bandwidth, checkpoints, policy cost
+.\bin\hydra-sim.exe -preset guide                 # the six what-ifs
+.\scripts\hydra.ps1 demo                          # dashboard at http://127.0.0.1:8080
+.\bin\residency_audit.exe -online                 # PASS / FAIL with exit code</pre>
+<p class="small">Race detector: <code>go test -race ./...</code> (with gcc on PATH). Design rationale for every decision: <code>NOTES.md</code>.</p>
+</div>
+
+</body>
+</html>

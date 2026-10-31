@@ -295,6 +295,110 @@ reserved status colours, always with an icon and a label.
    `RESIDENCY_VIOLATION`. The codes exist in `internal/api/errors.go` from Milestone 1.
 6. One command to start the whole system + dashboard buttons — **done in Milestone 6**.
 
+## Milestone 7 — the seven improvements from the Pulsar comparison guide
+Each feature reuses the engines the brokers already run (placement, quorum, policy resolution,
+path choice, forecast math), so there is one implementation of each rule, not two.
+
+### 1. Granular failover checkpoints (`internal/broker/checkpoints.go`, `client.GroupConsumer`)
+- A checkpoint = low watermark + exact acked ranges above it (`client.RangeSet`, max 4096 ranges)
+  + in-flight offsets + an **owner epoch**. After failover the new owner skips everything already
+  acked, even when work finished out of order.
+- Stored as records in an internal topic **with the data topic's residency** (`__cp.<residency>`),
+  replicated like any partition, folded by a replicated state machine (`replica.Applier`) on every
+  replica. A checkpoint can never live somewhere its data couldn't.
+- `claim` bumps the epoch; `commit` is a compare-and-append on the leader (`ProduceIf`), so a
+  zombie consumer gets `STALE_EPOCH` (`stale_owner`) and can't move the checkpoint. Regressions
+  are refused (`checkpoint_regression`).
+- Why not offset-only (Kafka) / broker-side ack holes (Pulsar shared subs)? Offset-only
+  redelivers everything above the oldest unfinished message; Pulsar tracks individual acks but
+  its cursor is not fenced by an owner epoch against a paused consumer and isn't residency-scoped.
+- Measured: `TestGranularCheckpointsAndFencing` — 1 redelivery vs 100 offset-only; zombie commit
+  refused. `hydra-bench checkpoint` (20k msgs, 16 workers, heavy tail, 400 crash trials):
+  duplicates median **67 vs 587**, p95 **145 vs 973**; checkpoint median 9 ranges.
+
+### 2. Adaptive replication bandwidth (`internal/flow`)
+- Every inter-region send acquires bytes from a per-link token bucket; classes are picked by
+  start-time fair queuing: control (strict first), urgent (w=8), live (w=4), recovery (adaptive).
+- **AIMD on recovery's weight** every 100 ms from the p90-EWMA of live queueing delay: ×0.7 when
+  live waits > 20 ms, +0.25 when < 10 ms and a backlog exists; bounded [0.25, 6] so neither class
+  starves. Work-conserving: idle capacity flows to whoever waits.
+- Small control/urgent sends (≤ 4 KB) may **overdraw** the bucket from a separate 5%-of-capacity
+  budget, so a vote never waits for a 128 KB catch-up chunk's debt (urgent deadline misses 14% → 0%).
+- Batches are classified at the source: recovery when the follower is > 1 batch behind, live
+  otherwise, urgent for leader markers; catch-up batches grow to 256 KB cross-region.
+- Measured (`hydra-bench bandwidth`, link 4 MB/s → 2.4 MB/s mid-run, 10 MB backlog, median of 3):
+  live p95 **57 ms adaptive vs 632 ms FIFO vs 627 ms fixed-50%**; urgent over 25 ms deadline
+  **0% vs 100% vs 70%**; backlog cleared 8.0 s vs 6.9 s FIFO (the honest cost: catch-up yields to
+  live traffic) vs 7.9 s fixed; link utilization ≈100% in all three.
+- Assumption: capacity is configured (`link_capacity_mbps` via the admin net API / dashboard);
+  we don't estimate available bandwidth. Unlimited links are never shaped.
+
+### 3. Message-level jurisdiction (`internal/policy`, `internal/residency`, `internal/trail`)
+- Policies separate **storage** regions from **transit** regions, plus a durability floor
+  (`min_acks`). They arrive as an Ed25519-**signed, versioned, expiring** document; brokers refuse
+  bad signatures, older versions (no rollback), unknown regions, and **fail closed** (missing or
+  expired policy ⇒ `POLICY_UNAVAILABLE`, no data moves).
+- Producers can only **narrow**: a per-message class header is intersected with the topic's
+  policy (storage ∩, transit ∩, stricter acks wins); a requested relay (`via`) must be permitted.
+- Checked at **every hop** (entry, forward, proxy, relay, replicate-send/accept, store); relays
+  are limited to 2 hops with loop detection; transit-only regions proxy without touching disk.
+- Every deny (and sampled allows) goes to an append-only decision trail (`decisions.log`);
+  `/admin/v1/compliance` returns a broker-signed evidence bundle; `residency_audit` judges
+  `policy:<class>` data against the signed document and fails closed if it can't verify it.
+- Pulsar's geo-replication is per-namespace cluster lists: no storage/transit split, no
+  per-message narrowing, no signed policy, no per-hop audit record.
+- Measured: one policy check costs **0.1–0.8 µs** per batch without logging, **1.4 µs** with an
+  audit record (`hydra-bench policy`) — against 80–220 ms cross-region RTTs.
+
+### 4. Predictive recovery (`internal/forecast`, `internal/broker/forecast.go`)
+- Every 500 ms each broker samples follower lag, consumer-group lag and disk growth; EWMA of
+  arrival and drain rates (α 0.2) with variance gives time-to-clear with a low/high range and
+  time-to-full. Recommendations are plain sentences (e.g. "storage fills before the backlog
+  clears: prioritise recovery bandwidth").
+- Deliberately simple and explainable; no ML. Limitation: assumes rates stay near recent
+  averages; a step change takes a few seconds to show up.
+
+### 5. Failure & policy simulator (`internal/sim`, `cmd/hydra-sim`, dashboard "What-if")
+- Steps: `region_down`, `region_isolate`, `link_slow`, `link_cut`, `traffic`, `transit_remove`,
+  `storage_remove`, `storage_full`, `recovering`. Predicts writability per (partition, client
+  region), relay paths and which classes may not use them, per-region backlog and catch-up time,
+  link utilization, and data a proposed policy change would strand.
+- **Same code as the brokers**: `placement.*`, `placement.Quorum`, policy `Resolve`/`Narrow`,
+  `geo.ChooseRelay` (extracted from the router), `forecast.TimeToClear`. Policy changes are
+  evaluated with `policy.ForSimulation` (unsigned, never used by brokers).
+- **Validated against the real cluster** (`TestSimulatorMatchesCluster`): predicted placement
+  equals actual placement for every partition, and after killing IN **18/18** (partition, client
+  region) writability outcomes agree. The test caught a real modelling gap first (acks=all), now fixed.
+- Limitation: backlog math is steady-state; it doesn't model per-message size distributions or
+  TCP dynamics.
+
+### 6. Cross-region payload dedup (`internal/replica/dedup.go`) — stretch goal, done
+- On cross-region replication only: values ≥ 1 KB that the follower is known to hold are sent as
+  their SHA-256; the follower resolves them from an index of its own log, verifies the hash, and
+  stores the full value. Anything unresolvable ⇒ `NeedFull` ⇒ resend in full. Bounded memory
+  (20k hashes per follower). Scoped to one partition, so no cross-tenant references.
+- Logs always contain complete payloads (no blob store), so recovery, truncation, audit and
+  retention never depend on dedup. `-no-dedup` turns it off.
+- Measured: `TestCrossRegionDedup` — 78 records sent as references, 655,200 bytes not sent.
+  Only helps workloads that repeat large payloads; costs one SHA-256 per large value.
+
+### 7. Per-message delivery & durability modes
+- `acks`: `leader` (fast, may lose the last batch on leader loss), `quorum` (default), `all`
+  (every replica). A policy's `min_acks` is a floor producers can't go below; the response says
+  which mode was applied. Classes: `urgent` / `live` / `recovery` hints feed the link scheduler.
+- Measured: `TestAcksModes`; the simulator and the cluster agree that `acks=all` data stops
+  accepting writes when any replica is unreachable — the trade-off is explicit, not hidden.
+
+### Extras beyond the guide
+Prometheus `/metrics`; one-command signed policies (`hydra-policy ensure`, broker `-policies`);
+refused entries recorded in the decision trail; dashboard panels for all of the above;
+`hydra-bench` with fair baselines on the same code paths.
+
+### Honest framing
+Baselines are modes of *our* code (FIFO / fixed share / offset-only), not Apache Pulsar or Kafka
+binaries (banned here). They isolate the algorithmic difference; absolute numbers on a laptop
+over loopback don't transfer to WAN deployments.
+
 ## Measured results
 | Milestone | Scenario | Result |
 |---|---|---|
@@ -320,6 +424,9 @@ reserved status colours, always with an icon and a label.
 | 4 | tests ×5: slow link | reroute decided 135–180 ms after the delay starts (≈3 probes) |
 
 | 5 | `hydra-chaos`, all 6 scenarios, real processes (see table below) | all PASS; 0 lost / 0 dups / 0 order violations over ~900k acked messages |
+| 7 | `hydra-chaos` again with signed policies installed (`results/chaos-20261031-183900.md`) | all 6 PASS; 0 lost / 0 dups / 0 order over ~904k acked; audits PASS before/during/after |
+| 7 | `TestSimulatorMatchesCluster` | placement identical; 18/18 writability outcomes agree after killing IN |
+| 7 | `hydra-bench` (`results/bench.md`) | live p95 57 ms vs 632 ms FIFO; urgent misses 0% vs 100%; crash duplicates 67 vs 587 (median) |
 
 ### Chaos results (Milestone 5, `results/chaos-20261031-162802.md`)
 | Scenario | Acked | Lost | Dups | Order | Max stall surviving | Max stall global | Max stall affected | msg/s | Slowest error | Slowest probe | Audit b/d/a |
@@ -341,8 +448,13 @@ Slow-link: EU↔IN direct RTT measured 301 ms; EU-led global traffic from IN wen
 fetch p50 1.1 ms before vs 1.4 ms during the fault.
 
 ## Known limitations
-- In-memory index (see above). No retention, compaction, consumer groups or auth.
-- Consumers read by explicit offset; no committed consumer offsets (yet).
+- In-memory index (see above). No retention, compaction or auth.
+- Consumer groups have granular, fenced checkpoints (Milestone 7) but no automatic partition
+  assignment/rebalancing: a consumer claims a partition explicitly.
+- Policy documents expire by wall clock (brokers' clocks must be roughly right); the admin
+  signing key sits in `configs/` for the demo — in production it would live offline / in an HSM.
+- A policy change does not migrate data already stored: the simulator lists what a change would
+  strand, and the audit flags it, but moving it is an operator action.
 - Produce across multiple partitions in one request is not atomic (each partition's slice is).
 - Idempotence needs the client to use producer id + sequence numbers (the Go `client.Producer`
   and the chaos load do); plain produce requests (curl, CLI) can still duplicate on retry.
