@@ -135,12 +135,47 @@ unacknowledged tail and follows.
 
 **Routing**: any broker accepts produce/fetch and forwards to the partition leader.
 
-## Global topics under partition (Milestone 4 plan)
-- A global partition has replicas in all 3 regions; writes commit at a majority of regions,
-  leader carries an epoch. An isolated region can't reach a majority, so it rejects global
-  writes fast (explicit error, no hang). No split-brain: the minority side is fenced by epoch.
-- The isolated region keeps serving its own resident topics (all replicas are local).
-- On heal the region truncates to the point of agreement with the current leader and catches up.
+## Residency enforcement (Milestone 3)
+Rule: a topic tagged `residency=<REGION>` may only be stored on, replicated to, or relayed
+through brokers whose **configured** region (cluster config, not self-reported) is that region.
+`global` may go anywhere. Enforced in code at every point data could move (`internal/residency`):
+
+| Where | Check |
+|---|---|
+| Topic creation | a region refuses topics resident elsewhere (`RESIDENCY_VIOLATION wrong_region`), on the receiving broker and again on the controller |
+| Placement (controller) | only brokers in the residency region are eligible replicas, even if the region's peer list is misconfigured to include outsiders |
+| Replica creation | a broker refuses to create a partition directory for data it may not hold (nothing is written) |
+| Replication, sending | a leader never streams a resident partition to an out-of-region follower |
+| Replication, receiving | a broker refuses appends it may not store, and refuses resident data *arriving from* an out-of-region sender (checked against the sending broker's id) |
+| Relay / forwarding | a broker refuses to accept or forward produce/fetch for a resident topic it may not relay, and won't forward to an out-of-region leader |
+
+Every refusal is logged (`residency violation blocked`) and counted (`residency_rejections` in
+`/admin/v1/status`). Topic *names and configs* (metadata) are not treated as resident data.
+Trade-off (for the pitch): data that legally can't leave a region can't survive the loss of
+that whole region. Resident topics are as available as their region, no more.
+
+**Signed manifests (`internal/manifest`)** — each broker has an Ed25519 key (`manifest.key` in
+its data dir, created on first start) and serves `GET /admin/v1/manifest`: every segment it
+stores with topic, residency tag, size and SHA-256, signed.
+
+**`residency_audit` (`cmd/residency_audit`)**
+- Offline (default): scans every broker data directory under `data/`. Violations: resident data
+  on a broker configured in another region; partition data without a residency tag; a residency
+  tag naming no region; `broker.json` disagreeing with the cluster config (relabelled dir); data
+  directories belonging to no configured broker.
+- `-online`: also fetches each live broker's manifest, verifies the signature against a key
+  pinned on first use (`data/audit-trust.json`; a changed key is a violation), applies the same
+  rules to what the broker *reports*, and checks the manifest against the bytes on disk
+  (a sealed segment that doesn't match its signed hash is a violation).
+- Output: table + findings + PASS/FAIL; `-json` writes the report; exit code 1 on FAIL.
+- Safe to run during chaos: dead brokers are still covered by the disk scan; manifests are
+  fetched *before* the disk scan so growing segments don't raise false alarms.
+- Limitation: trust on first use. A real deployment would pin keys out of band (or use an HSM).
+
+Bugs found while building it: (1) a non-IN broker could accept an IN produce on its public API
+and forward it to the IN leader — destination legal, but the data passed through the EU broker;
+now refused at entry. (2) On Windows, directory listings report stale sizes for files another
+process has open, so the audit read 0 bytes; it now stats each segment.
 
 ## Global topics under partition (Milestone 4 plan)
 - A global partition has replicas in all 3 regions; writes commit at a majority of regions,
@@ -161,9 +196,7 @@ unacknowledged tail and follows.
    in broker logs (`fenced stale epoch=… current=…`).
 2. Naive baseline mode — a single global controller, implemented as another `Coordinator`
    so the same chaos run can compare stall time and loss side by side.
-4. Signed segment manifests — each broker publishes a manifest of stored segments (hash per segment,
-   signed with a per-broker key); `residency_audit` verifies signatures + placement and emits a
-   compliance report.
+4. Signed segment manifests — **done in Milestone 3** (see Residency enforcement).
 5. Specific, fast errors — `REGION_UNAVAILABLE` with a `reason` (e.g. `region_crashed`,
    `region_isolated`), `NOT_LEADER` with a leader hint, `STALE_EPOCH`, `NOT_ENOUGH_REPLICAS`,
    `RESIDENCY_VIOLATION`. The codes exist in `internal/api/errors.go` from Milestone 1.
@@ -179,6 +212,11 @@ unacknowledged tail and follows.
 | 2 | `TestLeaderCrashUnderLoad` ×8 (test timings: lease 400 ms) | 0 acked messages lost; new leader in 175–606 ms; duplicates 0–50 from retries |
 | 2 | `TestControllerCrash` ×8 | new controller in 0.41–1.34 s; metadata intact |
 | 2 | `TestStaleLeaderAfterPauseIsFenced` ×8 | isolated leader never acks (first write `ack_timeout` at 0.8 s, then fails in < 200 ms); after heal it is fenced, truncates and converges |
+
+| 3 | 9 brokers, 3 resident topics + 1 global, ~84 MiB per replica set | `residency_audit -online`: PASS, 9/9 manifests verified |
+| 3 | IN partition directories copied onto an EU broker | FAIL, 6 violations (3 from disk scan, 3 from the broker's own signed manifest), exit 1 |
+| 3 | audit ×3 while producing 120k msg/s | PASS every time (≈1.5 s per audit); producer unaffected (max stall 51 ms) |
+| 3 | `TestResidencyEnforcedDespiteMisconfiguredPeers` (EU broker wrongly in IN's group) | IN partitions never placed on, replicated to, relayed through or accepted from it; audit PASS, then FAIL after planting data |
 
 ## Known limitations
 - In-memory index (see above). No retention, compaction, consumer groups or auth.

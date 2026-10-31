@@ -14,7 +14,9 @@ import (
 
 	"github.com/notaditya28/hydra-stream/internal/api"
 	"github.com/notaditya28/hydra-stream/internal/fsutil"
+	"github.com/notaditya28/hydra-stream/internal/layout"
 	"github.com/notaditya28/hydra-stream/internal/meta"
+	"github.com/notaditya28/hydra-stream/internal/residency"
 	"github.com/notaditya28/hydra-stream/internal/rpc"
 	"github.com/notaditya28/hydra-stream/internal/seglog"
 )
@@ -22,17 +24,7 @@ import (
 const (
 	PathAppend = "/internal/v1/replica/append"
 	PathFence  = "/internal/v1/replica/fence"
-
-	TopicsDir     = "topics"
-	TopicMetaFile = "topic.json"
 )
-
-// TopicMeta is written to <data>/topics/<topic>/topic.json before any partition data, so every
-// byte on disk carries its residency tag (the residency audit relies on this).
-type TopicMeta struct {
-	api.TopicConfig
-	CreatedAt time.Time `json:"created_at"`
-}
 
 // Manager owns this broker's partition replicas.
 type Manager struct {
@@ -41,14 +33,15 @@ type Manager struct {
 	logCfg  seglog.Config
 	rpc     *rpc.Client
 	timing  Timing
+	guard   *residency.Guard
 
 	mu     sync.RWMutex
 	parts  map[meta.PartKey]*Partition
 	closed bool
 }
 
-func NewManager(self, dataDir string, logCfg seglog.Config, client *rpc.Client, timing Timing) *Manager {
-	return &Manager{self: self, dataDir: dataDir, logCfg: logCfg, rpc: client, timing: timing, parts: map[meta.PartKey]*Partition{}}
+func NewManager(self, dataDir string, logCfg seglog.Config, client *rpc.Client, timing Timing, guard *residency.Guard) *Manager {
+	return &Manager{self: self, dataDir: dataDir, logCfg: logCfg, rpc: client, timing: timing, guard: guard, parts: map[meta.PartKey]*Partition{}}
 }
 
 func (m *Manager) Get(key meta.PartKey) *Partition {
@@ -67,12 +60,12 @@ func (m *Manager) All() []*Partition {
 	return out
 }
 
-func (m *Manager) partitionDir(topic string, p int) string {
-	return filepath.Join(m.dataDir, TopicsDir, topic, fmt.Sprint(p))
-}
-
-// ensure opens (creating if needed) our replica of a partition.
+// ensure opens (creating if needed) our replica of a partition. Nothing is written for a topic
+// whose residency forbids this broker's region.
 func (m *Manager) ensure(cfg api.TopicConfig, part int) (*Partition, error) {
+	if err := m.guard.CheckStore(cfg.Name, cfg.Residency); err != nil {
+		return nil, err
+	}
 	key := meta.PartKey{Topic: cfg.Name, Partition: part}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -82,17 +75,17 @@ func (m *Manager) ensure(cfg api.TopicConfig, part int) (*Partition, error) {
 	if p, ok := m.parts[key]; ok {
 		return p, nil
 	}
-	topicDir := filepath.Join(m.dataDir, TopicsDir, cfg.Name)
-	metaPath := filepath.Join(topicDir, TopicMetaFile)
+	topicDir := layout.TopicDir(m.dataDir, cfg.Name)
+	metaPath := filepath.Join(topicDir, layout.TopicMetaFile)
 	if _, err := os.Stat(metaPath); errors.Is(err, os.ErrNotExist) {
 		if err := os.MkdirAll(topicDir, 0o755); err != nil {
 			return nil, err
 		}
-		if err := fsutil.WriteJSONAtomic(metaPath, TopicMeta{cfg, time.Now().UTC()}); err != nil {
+		if err := fsutil.WriteJSONAtomic(metaPath, layout.TopicMeta{TopicConfig: cfg, CreatedAt: time.Now().UTC()}); err != nil {
 			return nil, err
 		}
 	}
-	p, err := openPartition(m.partitionDir(cfg.Name, part), key, m.self, m.logCfg, m.rpc, m.timing)
+	p, err := openPartition(layout.PartitionDir(m.dataDir, cfg.Name, part), key, cfg.Residency, m.self, m.logCfg, m.rpc, m.timing, m.guard)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", key, err)
 	}
@@ -106,7 +99,7 @@ func (m *Manager) Open(md *meta.Metadata) error {
 	for _, t := range md.Topics {
 		for i, pm := range t.Partitions {
 			if slices.Contains(pm.Replicas, m.self) {
-				if _, err := m.ensure(t.Config, i); err != nil {
+				if _, err := m.ensure(t.Config, i); err != nil && api.CodeOf(err) != api.CodeResidencyViolation {
 					return err
 				}
 			}
@@ -155,8 +148,21 @@ func (m *Manager) Stuck(md *meta.Metadata) []meta.PartKey {
 }
 
 func (m *Manager) Register(mux *http.ServeMux) {
-	rpc.Handle(mux, PathAppend, func(_ context.Context, req *AppendRequest) (*AppendResponse, error) {
+	rpc.Handle(mux, PathAppend, func(ctx context.Context, req *AppendRequest) (*AppendResponse, error) {
 		p := m.Get(meta.PartKey{Topic: req.Topic, Partition: req.Partition})
+		res := req.Residency
+		if p != nil {
+			res = p.residency // our own tag is authoritative
+		}
+		// Refuse resident data that would land here, or that arrives from outside its region.
+		if err := m.guard.CheckStore(req.Topic, res); err != nil {
+			return nil, err
+		}
+		for _, from := range []string{rpc.From(ctx), req.Leader} {
+			if err := m.guard.CheckPeer(req.Topic, res, from, "accept replication from"); err != nil {
+				return nil, err
+			}
+		}
 		if p == nil {
 			return nil, api.Errorf(api.CodeUnknownPartition, "%s has no replica of %s/%d", m.self, req.Topic, req.Partition)
 		}

@@ -7,7 +7,7 @@ routes around slow links, and a regional outage never freezes the surviving regi
 ## Status
 - [x] Milestone 1 — single broker: segmented on-disk log, topics/partitions/offsets, HTTP/JSON produce & consume
 - [x] Milestone 2 — in-region replication (3 zones, 2-of-3 acks, lease-elected controller, epoch-fenced leader failover)
-- [ ] Milestone 3 — residency enforcement + `residency_audit`
+- [x] Milestone 3 — residency enforcement at every data path + signed manifests + `residency_audit`
 - [ ] Milestone 4 — multi-region, global replication, latency-aware routing
 - [ ] Milestone 5 — chaos harness + correctness checker
 - [ ] Milestone 6 — dashboard
@@ -36,6 +36,18 @@ Get-Job | Receive-Job -Wait                                     # prints through
 .\scripts\hydra.ps1 stop
 ```
 
+Residency (all 9 brokers: IN, EU, US × 3 zones):
+```powershell
+.\scripts\hydra.ps1 start
+.\bin\hydra.exe create-topic -b 127.0.0.1:9101 -name aadhaar -partitions 3 -residency IN
+.\bin\hydra.exe create-topic -b 127.0.0.1:9201 -name aadhaar-copy -partitions 1 -residency IN   # RESIDENCY_VIOLATION
+.\bin\hydra.exe produce -b 127.0.0.1:9101 -topic aadhaar -n 200000 -keys
+.\bin\residency_audit.exe -online                                   # PASS, manifests verified
+Copy-Item -Recurse data\in-1\topics\aadhaar data\eu-2\topics\aadhaar # simulate misplaced data
+.\bin\residency_audit.exe -online                                   # FAIL, exit code 1
+Remove-Item -Recurse data\eu-2\topics\aadhaar
+```
+
 Raw HTTP works too:
 ```powershell
 curl.exe -s -X POST localhost:9101/v1/topics/orders/records -d '{\"records\":[{\"key\":\"u1\",\"value\":\"hello\"}]}'
@@ -53,6 +65,11 @@ internal/coord          Coordinator interface + lease-based controller election 
 internal/replica        partition replicas: 2-of-3 acks, epoch fencing, follower truncation
 internal/meta           region metadata (topics, replicas, leaders, epochs)
 internal/rpc            broker-to-broker JSON/HTTP + link blocker for partition simulation
+internal/residency      residency guard used at every store / replicate / relay / place decision
+internal/layout         on-disk layout of a broker data directory + scanner
+internal/manifest       signed (Ed25519) per-broker segment manifests
+internal/audit          residency audit rules and compliance report
+cmd/residency_audit     audit CLI (exit 1 on violations)
 scripts/hydra.ps1       start / stop / kill / restart brokers as local processes
 internal/transport/httpapi  HTTP/JSON adapter for api.Service
 internal/client         Go client used by the CLI, tests and (later) the load generator

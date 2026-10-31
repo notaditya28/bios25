@@ -16,6 +16,7 @@ import (
 	"github.com/notaditya28/hydra-stream/internal/api"
 	"github.com/notaditya28/hydra-stream/internal/fsutil"
 	"github.com/notaditya28/hydra-stream/internal/meta"
+	"github.com/notaditya28/hydra-stream/internal/residency"
 	"github.com/notaditya28/hydra-stream/internal/rpc"
 	"github.com/notaditya28/hydra-stream/internal/seglog"
 )
@@ -59,12 +60,14 @@ type follower struct {
 
 // Partition is one replica of a partition.
 type Partition struct {
-	Key    meta.PartKey
-	self   string
-	log    *seglog.Log
-	state  string
-	rpc    *rpc.Client
-	timing Timing
+	Key       meta.PartKey
+	residency string
+	guard     *residency.Guard
+	self      string
+	log       *seglog.Log
+	state     string
+	rpc       *rpc.Client
+	timing    Timing
 
 	mu          sync.Mutex
 	epoch       uint64 // highest leader epoch accepted (persisted): fences anything older
@@ -80,13 +83,13 @@ type Partition struct {
 	stopRepl    context.CancelFunc
 }
 
-func openPartition(dir string, key meta.PartKey, self string, logCfg seglog.Config, client *rpc.Client, timing Timing) (*Partition, error) {
+func openPartition(dir string, key meta.PartKey, res, self string, logCfg seglog.Config, client *rpc.Client, timing Timing, guard *residency.Guard) (*Partition, error) {
 	l, err := seglog.Open(dir, logCfg)
 	if err != nil {
 		return nil, err
 	}
 	p := &Partition{
-		Key: key, self: self, log: l, state: filepath.Join(dir, "state.json"),
+		Key: key, residency: res, guard: guard, self: self, log: l, state: filepath.Join(dir, "state.json"),
 		rpc: client, timing: timing, changed: make(chan struct{}),
 	}
 	var st partState
@@ -382,6 +385,7 @@ func (p *Partition) Fetch(ctx context.Context, offset uint64, maxRecords, maxByt
 type AppendRequest struct {
 	Topic       string          `json:"topic"`
 	Partition   int             `json:"partition"`
+	Residency   string          `json:"residency"`
 	Leader      string          `json:"leader"`
 	LeaderEpoch uint64          `json:"leader_epoch"`
 	PrevOffset  uint64          `json:"prev_offset"` // offset of the first record (= follower end offset if in sync)
@@ -472,6 +476,9 @@ func (p *Partition) handleAppend(req *AppendRequest) (*AppendResponse, error) {
 
 // replicate streams our log to one follower while we lead at epoch.
 func (p *Partition) replicate(ctx context.Context, to string, epoch uint64) {
+	if err := p.guard.CheckPeer(p.Key.Topic, p.residency, to, "replicate to"); err != nil {
+		return // never ship resident data out of its region, whatever the metadata says
+	}
 	next := p.log.EndOffset()
 	backoff := 20 * time.Millisecond
 	var lastSent time.Time
@@ -486,7 +493,7 @@ func (p *Partition) replicate(ctx context.Context, to string, epoch uint64) {
 				continue
 			}
 		}
-		req := AppendRequest{Topic: p.Key.Topic, Partition: p.Key.Partition, Leader: p.self, LeaderEpoch: epoch, PrevOffset: next}
+		req := AppendRequest{Topic: p.Key.Topic, Partition: p.Key.Partition, Residency: p.residency, Leader: p.self, LeaderEpoch: epoch, PrevOffset: next}
 		if next > 0 {
 			e, err := p.log.EpochAt(next - 1)
 			if err != nil {

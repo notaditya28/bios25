@@ -39,22 +39,36 @@ type cluster struct {
 	t     *testing.T
 	nodes []*node
 	peers map[string]string
+	dir   map[string]api.Info
+	root  string
 }
 
 func newCluster(t *testing.T, n int) *cluster {
+	regions := make([]string, n)
+	for i := range regions {
+		regions[i] = "IN"
+	}
+	return newClusterRegions(t, regions)
+}
+
+// newClusterRegions starts one coordination group whose brokers are configured in the given
+// regions. Mixing regions models a misconfigured peer list.
+func newClusterRegions(t *testing.T, regions []string) *cluster {
 	t.Helper()
-	c := &cluster{t: t, peers: map[string]string{}}
-	root := t.TempDir()
-	for i := 0; i < n; i++ {
+	c := &cluster{t: t, peers: map[string]string{}, dir: map[string]api.Info{}, root: t.TempDir()}
+	count := map[string]int{}
+	for i, region := range regions {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		id := fmt.Sprintf("in-%d", i+1)
-		nd := &node{id: id, addr: ln.Addr().String(), dir: filepath.Join(root, id), net: rpc.NewNet()}
+		count[region]++
+		id := fmt.Sprintf("%s-%d", strings.ToLower(region), count[region])
+		nd := &node{id: id, addr: ln.Addr().String(), dir: filepath.Join(c.root, id), net: rpc.NewNet()}
 		ln.Close()
 		c.nodes = append(c.nodes, nd)
 		c.peers[id] = nd.addr
+		c.dir[id] = api.Info{ID: id, Region: region, Zone: fmt.Sprintf("%s-%c", strings.ToLower(region), 'a'+i)}
 	}
 	for i := range c.nodes {
 		c.start(i)
@@ -72,8 +86,8 @@ func (c *cluster) start(i int) {
 	nd := c.nodes[i]
 	ct, rt := FastTiming()
 	b, err := Open(Config{
-		Info:    api.Info{ID: nd.id, Region: "IN", Zone: fmt.Sprintf("in-%c", 'a'+i)},
-		DataDir: nd.dir, Regions: []string{"IN", "EU", "US"}, Peers: c.peers,
+		Info:    c.dir[nd.id],
+		DataDir: nd.dir, Regions: []string{"IN", "EU", "US"}, Peers: c.peers, Directory: c.dir,
 		Log: seglog.Config{SegmentBytes: 256 << 10}, Coord: ct, Replica: rt, Net: nd.net,
 	})
 	if err != nil {

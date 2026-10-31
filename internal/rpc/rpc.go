@@ -152,6 +152,14 @@ func (c *Client) Call(ctx context.Context, peer, path string, in, out any) error
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+type fromKey struct{}
+
+// From returns the id of the broker that sent the internal request handled under ctx ("" if unknown).
+func From(ctx context.Context) string {
+	s, _ := ctx.Value(fromKey{}).(string)
+	return s
+}
+
 // Handle registers a JSON handler for POST path.
 func Handle[Req, Resp any](mux *http.ServeMux, path string, fn func(context.Context, *Req) (*Resp, error)) {
 	mux.HandleFunc("POST "+path, func(w http.ResponseWriter, r *http.Request) {
@@ -159,7 +167,8 @@ func Handle[Req, Resp any](mux *http.ServeMux, path string, fn func(context.Cont
 		if !httpapi.Decode(w, r, &req) {
 			return
 		}
-		resp, err := fn(r.Context(), &req)
+		ctx := context.WithValue(r.Context(), fromKey{}, r.Header.Get(FromHeader))
+		resp, err := fn(ctx, &req)
 		if err != nil {
 			httpapi.WriteError(w, err)
 			return

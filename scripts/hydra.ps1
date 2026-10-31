@@ -17,6 +17,9 @@ param(
 )
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $PSScriptRoot)
+if (-not (Get-Command go -ErrorAction SilentlyContinue) -and (Test-Path "C:\Program Files\Go\bin\go.exe")) {
+    $env:Path = "C:\Program Files\Go\bin;$env:Path"   # terminals opened before Go was installed
+}
 $cluster = Get-Content $Config -Raw | ConvertFrom-Json
 New-Item -ItemType Directory -Force data\logs, data\pids | Out-Null
 
