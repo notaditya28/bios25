@@ -95,8 +95,9 @@ Hydra vs a naive single-global-controller design, same scenarios side by side (�
 ```powershell
 .\scripts\hydra.ps1 compare          # or: .\bin\hydra-chaos.exe -mode compare
 ```
-Latest: Hydra 7/7 PASS, baseline 5/7 — when India is cut off and loses a broker, Hydra fails over
-inside India in 0.6 s; with one global controller India's data stays frozen for the whole fault.
+Latest: Hydra 7/7 PASS, baseline 6/7. The difference that holds every run: when India is cut off
+and loses its leader, Hydra fails over inside India in 0.59 s; with one global controller India's
+data stays frozen for the whole fault (8.25 s). Other scenarios are comparable on one laptop.
 
 Chaos harness — starts all 9 brokers itself, runs every scenario under load, verifies every
 acknowledged message and the residency audit, prints the results table (≈2 minutes):
@@ -123,6 +124,15 @@ What-if before it happens, and benchmarks against baselines on the same code pat
 .\bin\hydra-sim.exe -step storage_remove:financial:EU       # dry-run a policy change
 .\bin\hydra-sim.exe -broker 127.0.0.1:9101 -step region_isolate:US   # live topics + measured RTTs
 .\bin\hydra-bench.exe -out results\bench.md                # bandwidth, checkpoint, policy-cost
+```
+
+Containers (local testing only; same binary and config format, Docker Desktop running):
+```powershell
+docker compose up --build -d             # signs the demo policies once, starts 9 brokers on 127.0.0.1:9101-9303
+.\bin\hydra.exe create-topic -b 127.0.0.1:9201 -name prices -partitions 3 -residency global
+docker compose kill in-1 in-2 in-3        # crash a whole region; EU/US keep serving global topics
+docker compose start in-1 in-2 in-3       # it rejoins and catches up
+docker compose down -v                    # stop and delete all data
 ```
 
 Raw HTTP works too:

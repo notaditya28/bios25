@@ -9,6 +9,7 @@ installed after older terminals started) or run `$env:Path = "C:\Program Files\G
 | 1. Unit + cluster tests | `go test ./...` | ~1 min | every line starts with `ok` |
 | 2. Chaos suite (real processes) | `.\scripts\hydra.ps1 chaos` | ~3–4 min | table with `PASS` on all 7 rows, `0` in LOST / DUPS / ORDER, exit code 0 |
 | 2b. Hydra vs single global controller | `.\scripts\hydra.ps1 compare` | ~8 min | Hydra all PASS; baseline FAILs `isolate+kill-leader` (its isolated region can't elect a leader) |
+| 2c. Containers (optional, Docker Desktop running) | `docker compose up --build -d` then `docker compose ps` | ~1 min first build | 9 `running` brokers; see README "Containers" for crash tests; `docker compose down -v` to clean up |
 | 3. Live demo + dashboard | `.\scripts\hydra.ps1 demo` | starts in ~10 s | browser opens http://127.0.0.1:8080 with ~6k msg/s and `residency PASS` |
 | 4. Residency audit by hand | `.\bin\residency_audit.exe -online` (while the demo runs) | ~2 s | `Verdict: PASS`, all manifests `verified` |
 

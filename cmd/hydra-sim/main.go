@@ -202,8 +202,24 @@ func buildModel(cfgPath, polPath, topicsPath, broker string, rate, msgBytes, cap
 		if err != nil {
 			return m, fmt.Errorf("list topics from %s: %w", broker, err)
 		}
-		for _, t := range ts {
-			m.Topics = append(m.Topics, t.TopicConfig)
+		// A broker only lists topics its region stores; ask one broker per region for the rest.
+		seen := map[string]bool{}
+		add := func(ts []api.TopicInfo) {
+			for _, t := range ts {
+				if !seen[t.Name] {
+					seen[t.Name] = true
+					m.Topics = append(m.Topics, t.TopicConfig)
+				}
+			}
+		}
+		add(ts)
+		for _, r := range cluster.Regions {
+			for _, b := range r.Brokers {
+				if more, err := client.New(b.Addr).Topics(ctx); err == nil {
+					add(more)
+					break
+				}
+			}
 		}
 		// Measured RTTs: each region's first broker's view of the others.
 		for _, r := range cluster.Regions {

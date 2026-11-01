@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -139,12 +140,18 @@ type Client struct {
 	hc    *http.Client
 }
 
-func NewClient(self string, addrs map[string]string, net *Net) *Client {
+// dialer bounds connection setup. A crashed peer on the same host refuses connections at once,
+// but a vanished machine or container just drops packets; without a bound every call to it
+// would wait for the caller's whole deadline before trying someone else.
+var dialer = &net.Dialer{Timeout: time.Second, KeepAlive: 5 * time.Second}
+
+func NewClient(self string, addrs map[string]string, n *Net) *Client {
 	return &Client{
 		self:  self,
 		addrs: addrs,
-		net:   net,
+		net:   n,
 		hc: &http.Client{Transport: &http.Transport{
+			DialContext:         dialer.DialContext,
 			MaxIdleConnsPerHost: 128,
 			IdleConnTimeout:     90 * time.Second,
 		}},

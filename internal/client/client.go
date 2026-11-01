@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -28,7 +29,13 @@ func New(addr string) *Client {
 	}
 	return &Client{
 		base: strings.TrimRight(addr, "/"),
-		hc:   &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 64, IdleConnTimeout: 90 * time.Second}},
+		hc: &http.Client{Transport: &http.Transport{
+			// Bounded connect: a dead broker's address may silently drop packets (another machine,
+			// a killed container); fail fast so the caller moves on to the next broker.
+			DialContext:         (&net.Dialer{Timeout: time.Second, KeepAlive: 5 * time.Second}).DialContext,
+			MaxIdleConnsPerHost: 64,
+			IdleConnTimeout:     90 * time.Second,
+		}},
 	}
 }
 

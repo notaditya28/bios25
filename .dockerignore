@@ -1,0 +1,10 @@
+# Never bake the policy signing key (or local state) into an image.
+configs/policy-admin.key
+bin/
+data/
+data-*/
+results/
+docs/
+*.log
+*.pdf
+.git/

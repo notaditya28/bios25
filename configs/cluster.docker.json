@@ -1,0 +1,29 @@
+{
+  "policy_public_key_file": "policy-admin.pub",
+  "regions": [
+    {
+      "name": "IN",
+      "brokers": [
+        {"id": "in-1", "zone": "in-a", "addr": "in-1:9101"},
+        {"id": "in-2", "zone": "in-b", "addr": "in-2:9102"},
+        {"id": "in-3", "zone": "in-c", "addr": "in-3:9103"}
+      ]
+    },
+    {
+      "name": "EU",
+      "brokers": [
+        {"id": "eu-1", "zone": "eu-a", "addr": "eu-1:9201"},
+        {"id": "eu-2", "zone": "eu-b", "addr": "eu-2:9202"},
+        {"id": "eu-3", "zone": "eu-c", "addr": "eu-3:9203"}
+      ]
+    },
+    {
+      "name": "US",
+      "brokers": [
+        {"id": "us-1", "zone": "us-a", "addr": "us-1:9301"},
+        {"id": "us-2", "zone": "us-b", "addr": "us-2:9302"},
+        {"id": "us-3", "zone": "us-c", "addr": "us-3:9303"}
+      ]
+    }
+  ]
+}

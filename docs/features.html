@@ -188,7 +188,7 @@ our own code; only the Go standard library is used (HTTP, JSON, Ed25519, SHA-256
 <tr><td>Data residency unit</td><td>whole cluster (mirror selected topics)</td><td>namespace/topic allowed-cluster list</td><td class="yes">per topic and per message, storage ≠ transit</td></tr>
 <tr><td>Signed, versioned, fail-closed policy</td><td class="no">no</td><td class="no">no</td><td class="yes">Ed25519, no rollback, expiry</td></tr>
 <tr><td>Per-hop jurisdiction audit record</td><td class="no">no</td><td class="no">no</td><td class="yes">every deny + sampled allows, signed evidence</td></tr>
-<tr><td>Isolated region loses a broker</td><td class="part">stretched cluster: waits for remote controller</td><td class="part">per-cluster</td><td class="yes">fails over inside the region (measured: 0.6 s vs frozen)</td></tr>
+<tr><td>Isolated region loses a broker</td><td class="part">stretched cluster: waits for remote controller</td><td class="part">per-cluster</td><td class="yes">fails over inside the region (measured: 0.59 s vs frozen 8.25 s)</td></tr>
 <tr><td>Region failure isolation</td><td class="part">per-cluster; stretch clusters share a controller quorum</td><td class="part">per-cluster; shared config store for geo</td><td class="yes">independent regions; global data by region quorum</td></tr>
 <tr><td>Replication bandwidth control</td><td class="part">static throttle rate</td><td class="part">static dispatch-rate limits</td><td class="yes">adaptive (AIMD on live delay) + urgent overdraft</td></tr>
 <tr><td>Consumer progress after failover</td><td class="part">single committed offset</td><td class="part">individual acks (shared subs), cursor not owner-fenced</td><td class="yes">ranges + in-flight + owner epoch fencing</td></tr>
@@ -305,21 +305,22 @@ Surviving regions never stalled more than 16 ms: well inside the 1 s target.</p>
 group, so a single controller decides every leader in every region (the common "one cluster across regions" setup). Same
 replication, same storage, same scenarios — only the control plane differs. <code>hydra-chaos -mode compare</code> runs both on fresh clusters.</p>
 <table>
-<tr><th>Scenario</th><th class="n">Surviving data, max stall<br>Hydra / baseline</th><th class="n">Global topic, max stall<br>Hydra / baseline</th><th>Result</th></tr>
-<tr><td>no fault</td><td class="n">22 / 200 ms</td><td class="n">27 / 217 ms</td><td>PASS / PASS</td></tr>
-<tr><td>kill-broker</td><td class="n">25 / 8,332 ms*</td><td class="n">84 / 5,094 ms</td><td>PASS / <span class="no">FAIL*</span></td></tr>
-<tr><td>kill-zone</td><td class="n">59 / 138 ms</td><td class="n">57 / 770 ms</td><td>PASS / PASS</td></tr>
-<tr><td>kill-region</td><td class="n">47 / 81 ms</td><td class="n">229 / 776 ms</td><td>PASS / PASS</td></tr>
-<tr><td>isolate-region</td><td class="n">52 / 134 ms</td><td class="n">156 / 157 ms</td><td>PASS / PASS</td></tr>
-<tr><td>slow-link</td><td class="n">52 / 172 ms</td><td class="n">311 / 308 ms</td><td>PASS / PASS</td></tr>
-<tr><td><b>isolate+kill-leader</b></td><td class="n">IN back in <b>588 ms</b> / frozen <b>8,490 ms</b></td><td class="n">163 / 197 ms</td><td>PASS / <span class="no">FAIL</span></td></tr>
+<tr><th>Scenario</th><th class="n">Hydra: max stall<br>surviving / global</th><th class="n">Baseline: max stall<br>surviving / global</th><th>Result</th></tr>
+<tr><td>no fault</td><td class="n">33 / 39 ms</td><td class="n">21 / 14 ms</td><td>PASS / PASS</td></tr>
+<tr><td>kill-broker</td><td class="n">13 / 778 ms</td><td class="n">19 / 75 ms</td><td>PASS / PASS</td></tr>
+<tr><td>kill-zone</td><td class="n">13 / 17 ms</td><td class="n">23 / 28 ms</td><td>PASS / PASS</td></tr>
+<tr><td>kill-region</td><td class="n">13 / 199 ms</td><td class="n">34 / 209 ms</td><td>PASS / PASS</td></tr>
+<tr><td>isolate-region</td><td class="n">21 / 155 ms</td><td class="n">20 / 159 ms</td><td>PASS / PASS</td></tr>
+<tr><td>slow-link</td><td class="n">26 / 311 ms</td><td class="n">16 / 311 ms</td><td>PASS / PASS</td></tr>
+<tr><td><b>isolate+kill-leader</b></td><td class="n">IN back in <b>590 ms</b></td><td class="n">IN frozen <b>8,250 ms</b></td><td>PASS / <span class="no">FAIL</span></td></tr>
 </table>
-<p><b>The deciding case.</b> Cut India off, then kill the leader of India's own topic. India still has 2 of 3 brokers. Hydra's India controller
-elects a new leader inside India in 588 ms; with one global controller on the other side of the cut nobody can elect one, so India's
-data is frozen for the whole fault — exactly the "isolated region keeps serving its own data" requirement. This fails every run.</p>
-<p class="small">* Failed in 1 of 3 runs: with one controller tracking 9 brokers, controllership churned and re-elected the US topic's leader while it was
-alive, stalling US 8.3 s; two repeats passed (375–510 ms, still 15–20× Hydra). Both designs lost and duplicated nothing in every scenario.
-On one laptop regions are 0.5 ms apart; across a real WAN the stretched controller would also pay inter-region RTT on every lease and election.</p>
+<p><b>The deciding case — every run (3 of 3).</b> Cut India off, then kill the leader of India's own topic. India still has 2 of 3 brokers.
+Hydra's India controller elects a new leader inside India in ~0.6 s; with one global controller on the other side of the cut nobody can
+elect one, so India's data is frozen for the whole fault — exactly the "isolated region keeps serving its own data" requirement.</p>
+<p class="small">Final run <code>results/compare-20261101-084600.md</code>; both designs lost and duplicated nothing. Elsewhere the two designs are comparable on one laptop.
+The first compare run also showed a baseline failure in kill-broker (controller churn re-elected a live US leader, 8.3 s stall) that did not
+recur in three later runs, so it is not claimed. On one laptop regions are 0.5 ms apart; across a real WAN the stretched controller would also
+pay inter-region RTT on every lease renewal and election, which this setup can't show.</p>
 
 <h3>A11. One-command demo and dashboard</h3>
 <p><code>.\scripts\hydra.ps1 demo</code> builds everything, signs the policies, starts 9 brokers and load, and opens a dashboard with the
@@ -508,7 +509,7 @@ topics and measured RTTs) and as the dashboard's "What-if" panel.</p>
 5× traffic · destination storage full · two regions recover; plus isolation, link cut and storage removal.</p>
 <table>
 <tr><th>What-if</th><th>Prediction (demo topology)</th></tr>
-<tr><td>IN goes offline</td><td>13/16 writable; IN-resident and pii-in stop (by law); 9 IN replicas to catch up, ~4 s</td></tr>
+<tr><td>IN goes offline</td><td>11/16 writable; IN-resident and pii-in stop (by law); both financial partitions stop because their policy demands acks=all; IN replicas catch up in ~3 s</td></tr>
 <tr><td>IN↔EU 10× slower</td><td>IN↔EU relayed via US (300 vs 1200 ms) — but <i>not</i> for financial, which keeps the slow direct path</td></tr>
 <tr><td>Remove US from eu-personal transit</td><td>"clients in US would get RESIDENCY_VIOLATION" — fix before signing</td></tr>
 <tr><td>Remove EU from financial storage</td><td>Lists every EU replica that would hold now-forbidden data</td></tr>
@@ -563,6 +564,8 @@ when a replica's region fails — a trade-off made explicit rather than hidden.<
     jurisdiction decisions, signed with the broker's key.</li>
   <li><b>One-command signed policies</b>: <code>hydra-policy ensure</code> creates the admin key and signs only when needed; brokers start with
     <code>-policies</code> (signature still verified); <code>push</code> installs a new version cluster-wide.</li>
+  <li><b>Containers</b>: <code>docker compose up --build -d</code> runs the same 9 brokers in containers (local testing only); the signing key
+    never enters the image. Testing there exposed a missing connect timeout (a killed container drops packets), now fixed: leader-crash stall 4.05 s &rarr; 1.12 s.</li>
   <li><b>Benchmarks with fair baselines</b>: <code>hydra-bench</code> (Part B numbers) and the chaos harness (Part A numbers).</li>
 </ul>
 </div>
@@ -583,7 +586,7 @@ when a replica's region fails — a trade-off made explicit rather than hidden.<
 <tr><td>Jurisdiction (B3)</td><td>policy check cost per batch</td><td>0.1–1.4 µs</td></tr>
 <tr><td>Simulator (B5)</td><td>predictions vs real cluster</td><td>placement identical; 18/18 outcomes</td></tr>
 <tr><td>Dedup (B6)</td><td>repeated-payload test</td><td>655 KB not sent cross-region</td></tr>
-<tr><td>vs single global controller</td><td>7 scenarios, both designs</td><td>Hydra 7/7 PASS, baseline 5/7; isolated region: 0.6 s failover vs frozen 8.5 s</td></tr>
+<tr><td>vs single global controller</td><td>7 scenarios, both designs</td><td>Hydra 7/7 PASS, baseline 6/7; cut-off region losing its leader: 0.59 s failover vs frozen 8.25 s (3 of 3 runs)</td></tr>
 <tr><td>Throughput</td><td>single broker / 3-broker region / global</td><td>~700k / ~185k / ~84k msg/s (laptop, loopback)</td></tr>
 </table>
 

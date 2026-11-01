@@ -1,0 +1,52 @@
+# Hydra Stream in containers: 3 regions x 3 brokers, same binary and config format as the
+# local-process setup. Local testing only.
+#
+#   docker compose up --build -d        # builds, signs the demo policies once, starts 9 brokers
+#   docker compose ps
+#   docker compose stop in-1            # crash a broker;  docker compose start in-1  to bring it back
+#   docker compose down -v              # stop and delete all data
+#
+# Ports are published on 127.0.0.1 with the same numbers as the local setup (9101-9303), so the
+# host CLI works:  .\bin\hydra.exe topics -b 127.0.0.1:9201
+# Network faults (isolate a region, slow a link) use the brokers' admin API exactly as in the
+# local setup, so the same chaos/dashboard requests apply.
+
+x-broker: &broker
+  build: .
+  image: hydra-stream:local
+  depends_on:
+    policy-init:
+      condition: service_completed_successfully
+  volumes:
+    - ./configs:/app/configs:ro
+  restart: "no"
+
+services:
+  # Creates the admin key pair and signs configs/policies.json (only when missing or stale).
+  policy-init:
+    build: .
+    image: hydra-stream:local
+    entrypoint: ["hydra-policy", "ensure", "-config", "configs/cluster.docker.json"]
+    volumes:
+      - ./configs:/app/configs
+
+  in-1: { <<: *broker, command: ["-config", "configs/cluster.docker.json", "-id", "in-1", "-data", "/data", "-policies", "configs/policies.signed.json"], volumes: ["./configs:/app/configs:ro", "in-1:/data"], ports: ["127.0.0.1:9101:9101"] }
+  in-2: { <<: *broker, command: ["-config", "configs/cluster.docker.json", "-id", "in-2", "-data", "/data", "-policies", "configs/policies.signed.json"], volumes: ["./configs:/app/configs:ro", "in-2:/data"], ports: ["127.0.0.1:9102:9102"] }
+  in-3: { <<: *broker, command: ["-config", "configs/cluster.docker.json", "-id", "in-3", "-data", "/data", "-policies", "configs/policies.signed.json"], volumes: ["./configs:/app/configs:ro", "in-3:/data"], ports: ["127.0.0.1:9103:9103"] }
+  eu-1: { <<: *broker, command: ["-config", "configs/cluster.docker.json", "-id", "eu-1", "-data", "/data", "-policies", "configs/policies.signed.json"], volumes: ["./configs:/app/configs:ro", "eu-1:/data"], ports: ["127.0.0.1:9201:9201"] }
+  eu-2: { <<: *broker, command: ["-config", "configs/cluster.docker.json", "-id", "eu-2", "-data", "/data", "-policies", "configs/policies.signed.json"], volumes: ["./configs:/app/configs:ro", "eu-2:/data"], ports: ["127.0.0.1:9202:9202"] }
+  eu-3: { <<: *broker, command: ["-config", "configs/cluster.docker.json", "-id", "eu-3", "-data", "/data", "-policies", "configs/policies.signed.json"], volumes: ["./configs:/app/configs:ro", "eu-3:/data"], ports: ["127.0.0.1:9203:9203"] }
+  us-1: { <<: *broker, command: ["-config", "configs/cluster.docker.json", "-id", "us-1", "-data", "/data", "-policies", "configs/policies.signed.json"], volumes: ["./configs:/app/configs:ro", "us-1:/data"], ports: ["127.0.0.1:9301:9301"] }
+  us-2: { <<: *broker, command: ["-config", "configs/cluster.docker.json", "-id", "us-2", "-data", "/data", "-policies", "configs/policies.signed.json"], volumes: ["./configs:/app/configs:ro", "us-2:/data"], ports: ["127.0.0.1:9302:9302"] }
+  us-3: { <<: *broker, command: ["-config", "configs/cluster.docker.json", "-id", "us-3", "-data", "/data", "-policies", "configs/policies.signed.json"], volumes: ["./configs:/app/configs:ro", "us-3:/data"], ports: ["127.0.0.1:9303:9303"] }
+
+volumes:
+  in-1: {}
+  in-2: {}
+  in-3: {}
+  eu-1: {}
+  eu-2: {}
+  eu-3: {}
+  us-1: {}
+  us-2: {}
+  us-3: {}

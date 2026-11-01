@@ -429,7 +429,7 @@ over loopback don't transfer to WAN deployments.
 | 5 | `hydra-chaos`, all 6 scenarios, real processes (see table below) | all PASS; 0 lost / 0 dups / 0 order violations over ~900k acked messages |
 | 7 | `hydra-chaos` again with signed policies installed (`results/chaos-20261031-183900.md`) | all 6 PASS; 0 lost / 0 dups / 0 order over ~904k acked; audits PASS before/during/after |
 | 7 | `TestSimulatorMatchesCluster` | placement identical; 18/18 writability outcomes agree after killing IN |
-| 7 | `hydra-chaos -mode compare` (`results/compare-20261101-014904.md`) | Hydra 7/7 PASS; single-global-controller baseline 5/7 — isolated region's data frozen 8.5 s vs failover in 0.6 s |
+| 7 | `hydra-chaos -mode compare` (`results/compare-20261101-084600.md`) | Hydra 7/7 PASS, baseline 6/7 — cut-off region that loses its leader: Hydra fails over in 0.59 s, baseline frozen 8.25 s (3 of 3 runs) |
 | 7 | `hydra-bench` (`results/bench.md`) | live p95 57 ms vs 632 ms FIFO; urgent misses 0% vs 100%; crash duplicates 67 vs 587 (median) |
 
 ### Chaos results (Milestone 5, `results/chaos-20261031-162802.md`)
@@ -451,35 +451,50 @@ IN resident stream kept flowing inside IN (counted under "surviving": 15 ms max 
 Slow-link: EU↔IN direct RTT measured 301 ms; EU-led global traffic from IN went via us-3;
 fetch p50 1.1 ms before vs 1.4 ms during the fault.
 
-### Hydra vs a single global controller (`results/compare-20261101-014904.md`)
+### Hydra vs a single global controller (final run: `results/compare-20261101-084600.md`)
 Same binary and replication; only the coordination differs (`-coordination global`: one controller
 elected by a majority of all 9 brokers decides every leader in every region). 7 scenarios each,
 0 lost / 0 duplicates in both designs — the difference is availability.
 
-| Scenario | Max stall, surviving data (Hydra / baseline) | Max stall, global topic | Result |
+| Scenario | Max stall: surviving data / global topic (Hydra) | (baseline) | Result (Hydra / baseline) |
 |---|---|---|---|
-| baseline (no fault) | 22 ms / 200 ms | 27 / 217 ms | PASS / PASS |
-| kill-broker | 25 ms / 8,332 ms* | 84 / 5,094 ms | PASS / FAIL* |
-| kill-zone | 59 ms / 138 ms | 57 / 770 ms | PASS / PASS |
-| kill-region | 47 ms / 81 ms | 229 / 776 ms | PASS / PASS |
-| isolate-region | 52 ms / 134 ms | 156 / 157 ms | PASS / PASS |
-| slow-link | 52 ms / 172 ms | 311 / 308 ms | PASS / PASS |
-| isolate+kill-leader | IN data back in **588 ms** / frozen **8,490 ms** (whole fault) | 163 / 197 ms | PASS / **FAIL** |
+| no fault | 33 / 39 ms | 21 / 14 ms | PASS / PASS |
+| kill-broker | 13 / 778 ms | 19 / 75 ms | PASS / PASS |
+| kill-zone | 13 / 17 ms | 23 / 28 ms | PASS / PASS |
+| kill-region | 13 / 199 ms | 34 / 209 ms | PASS / PASS |
+| isolate-region | 21 / 155 ms | 20 / 159 ms | PASS / PASS |
+| slow-link | 26 / 311 ms | 16 / 311 ms | PASS / PASS |
+| **isolate+kill-leader** | **IN data back in 590 ms** | **IN frozen 8,250 ms** | PASS / **FAIL** |
 
-- **isolate+kill-leader** (new scenario, fails deterministically for the baseline): cut India off,
-  then kill the leader of India's own topic. India still has 2 of 3 brokers. Hydra's India
-  controller elects a new leader inside India (588 ms); the baseline's controller is on the other
+- **The one difference that holds in every run** (3 of 3: 8.25–8.49 s frozen vs 0.59 s): cut
+  India off, then kill the leader of India's own topic. India still has 2 of 3 brokers. Hydra's
+  India controller elects a new leader inside India; the baseline's controller is on the other
   side of the cut, so nobody can elect one and India's data stays frozen until the network heals.
   This is the brief's "an isolated region keeps serving its own data" requirement.
-- \* kill-broker failed for the baseline in 1 of 3 runs: with one controller tracking 9 brokers,
-  controllership churned (epochs 2→36 in one run) and it re-elected the *US* topic's leader while
-  the old one was alive, stalling US 8.3 s. Two repeats passed (surviving stall 375–510 ms, still
-  15–20× Hydra's). We report it as an observed risk, not a deterministic result.
-- Even without faults the global controller costs: surviving stalls ~2–9× higher and lower
-  throughput under faults (5.3–5.7k vs ~11.9k msg/s acknowledged in kill-broker), because every
-  liveness and leader decision depends on a 9-broker lease group spanning regions.
-- Honest note: on a single laptop the "regions" are 0.5 ms apart; on a real WAN a stretched
-  controller would also pay cross-region RTT on every lease renewal and election.
+- **Everything else is comparable on one laptop.** The first compare run (`results/compare-20261101-014904.md`) also showed
+  the baseline failing kill-broker once (controllership churned — epochs 2→36 — and it re-elected
+  a live US leader, stalling US 8.3 s) and 2–9× higher stalls; that did not recur in three later
+  runs, so we report it only as an observed risk of one 9-broker lease group, not as a result.
+- Honest note: on one laptop regions are 0.5 ms apart; across a real WAN the stretched controller
+  would also pay inter-region RTT on every lease renewal and election, which this setup can't show.
+
+## Containers (docker-compose)
+`Dockerfile` builds every command into one small image; `docker-compose.yml` runs 9 brokers from
+`configs/cluster.docker.json` (container hostnames instead of 127.0.0.1) plus a one-shot
+`policy-init` service that runs `hydra-policy ensure`. The signing key is excluded from the image
+(`.dockerignore`); brokers mount `configs/` read-only. Fault injection still goes through the
+brokers' admin API, so the same requests work.
+
+Verified (2026-11-01): image builds; all 9 containers healthy, a controller per region, policies
+installed; resident / global / policy topics; EU write to an IN topic refused (`WRONG_REGION`);
+killing all IN containers → EU/US global writes max stall 16 ms, IN topic from EU →
+`REGION_UNAVAILABLE`; IN restarts and catches up.
+
+Found and fixed because of it: a killed container's address *drops* packets instead of refusing
+connections (unlike a dead local process), and neither the broker RPC client nor the Go client had
+a connect timeout, so the first write after a leader crash stalled 4.05 s waiting on the dead
+address. Both now use a 1 s dial timeout; the same crash stalls 1.12 s (mostly that one timeout).
+The same happens on a real network when a machine disappears, so this matters beyond Docker.
 
 ## Known limitations
 - In-memory index (see above). No retention, compaction or auth.

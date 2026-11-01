@@ -581,7 +581,24 @@ func (w *world) links(pred *Prediction) {
 func (w *world) recommend(pred *Prediction) {
 	lost := pred.Total - pred.Writable
 	if lost > 0 {
-		pred.Recommendations = append(pred.Recommendations, fmt.Sprintf("%d of %d partitions would stop accepting writes; resident data in a lost region can't fail over by law — tell those clients to expect REGION_UNAVAILABLE.", lost, pred.Total))
+		resident, floor := 0, 0
+		for _, po := range pred.Partitions {
+			switch {
+			case po.Writable:
+			case strings.HasPrefix(po.Reason, "its only region"):
+				resident++
+			case strings.Contains(po.Reason, "acks=all"):
+				floor++
+			}
+		}
+		msg := fmt.Sprintf("%d of %d partitions would stop accepting writes", lost, pred.Total)
+		if resident > 0 {
+			msg += fmt.Sprintf("; %d hold resident data that by law can't fail over (clients get REGION_UNAVAILABLE)", resident)
+		}
+		if floor > 0 {
+			msg += fmt.Sprintf("; %d have an acks=all policy and wait for every replica (relax min_acks if availability matters more)", floor)
+		}
+		pred.Recommendations = append(pred.Recommendations, msg+".")
 	}
 	if len(pred.PolicyFindings) > 0 {
 		pred.Recommendations = append(pred.Recommendations, "the proposed policy conflicts with where data already lives — fix the findings before signing and pushing it.")
@@ -594,7 +611,7 @@ func (w *world) recommend(pred *Prediction) {
 		worst = math.Max(worst, r.CatchUpSecs)
 	}
 	if worst > 0 {
-		pred.Recommendations = append(pred.Recommendations, fmt.Sprintf("recovering replicas will need up to %s to catch up after the outage; keep the adaptive bandwidth controller on so live traffic isn't starved.", forecast.HumanDuration(worst)))
+		pred.Recommendations = append(pred.Recommendations, fmt.Sprintf("after the outage, recovering replicas need at most %s to catch up; keep the adaptive bandwidth controller on so live traffic isn't starved.", strings.TrimPrefix(forecast.HumanDuration(worst), "under ")))
 	}
 	for _, r := range pred.Routes {
 		if len(r.Forbidden) > 0 {
