@@ -468,15 +468,15 @@ function renderFeatures(f) {
     const tr = st == null ? null : st.concat(c.transit_regions || []);
     return `<tr><td>${esc(c.class)}</td><td>${esc(list(st))}</td><td>${esc(list(tr))}</td><td>${esc(c.min_acks || "quorum")}</td></tr>`;
   }).join("");
-  const regs = Object.keys(f.regions).sort();
+  const regs = Object.keys(f.regions || {}).sort();
   $("decCounts").innerHTML = regs.map((r) => `<tr><td><span class="swatch" style="background:var(--series-${r})"></span> ${esc(r)}</td><td class="num">${fmt(f.regions[r].allows)}</td><td class="num">${fmt(f.regions[r].denies)}</td></tr>`).join("");
-  const recent = regs.flatMap((r) => f.regions[r].decisions.filter((d) => d.decision === "deny")).slice(0, 6);
+  const recent = regs.flatMap((r) => (f.regions[r].decisions || []).filter((d) => d.decision === "deny")).slice(0, 6);
   $("decRecent").innerHTML = recent.map((d) => `<li>DENY ${esc(d.topic)} at ${esc(d.broker)} (${esc(d.hop)}${d.peer_region ? " → " + esc(d.peer_region) : ""}): ${esc(d.reason)}</li>`).join("") || `<li>no denials yet</li>`;
-  $("flowLinks").innerHTML = regs.flatMap((r) => f.regions[r].links.map((l) =>
+  $("flowLinks").innerHTML = regs.flatMap((r) => (f.regions[r].links || []).map((l) =>
     `<tr><td>${esc(r)} → ${esc(l.to)}</td><td class="num">${l.capacity_mbps ? Math.round(l.capacity_mbps) + " Mb/s" : "unlimited"}</td><td class="num">${l.capacity_mbps ? l.recovery_weight.toFixed(2) : "–"}</td><td class="num">${l.capacity_mbps ? l.live_p95_ms.toFixed(1) + " ms" : "–"}</td></tr>`)).join("");
-  const bl = regs.flatMap((r) => f.regions[r].backlogs).sort((a, b) => b.bytes - a.bytes).slice(0, 8);
+  const bl = regs.flatMap((r) => f.regions[r].backlogs || []).sort((a, b) => b.bytes - a.bytes).slice(0, 8);
   $("fcBacklogs").innerHTML = bl.map((b) => `<tr><td>${esc(b.partition)} on ${esc(b.follower)}</td><td class="num">${mb(b.bytes)}</td><td class="num">${secs(b.clear_s)}</td></tr>`).join("") || `<tr><td colspan="3" class="muted">every replica is caught up</td></tr>`;
-  const recs = [...new Set(regs.flatMap((r) => f.regions[r].recommendations))].slice(0, 6);
+  const recs = [...new Set(regs.flatMap((r) => f.regions[r].recommendations || []))].slice(0, 6);
   $("fcRecs").innerHTML = recs.map((x) => `<li>${esc(x)}</li>`).join("");
 }
 async function refreshFeatures() {

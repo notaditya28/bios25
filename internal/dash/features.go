@@ -71,7 +71,10 @@ func (d *Dash) features() featuresView {
 			Decisions      []trail.Decision
 		}
 		if getJSON(b.Addr, "/admin/v1/decisions?limit=6&deny=1", &dec) == nil {
-			rf.Allows, rf.Denies, rf.Decisions = dec.Allows, dec.Denies, dec.Decisions
+			rf.Allows, rf.Denies = dec.Allows, dec.Denies
+			if dec.Decisions != nil {
+				rf.Decisions = dec.Decisions
+			}
 		}
 		var fl map[string]flow.Stats
 		if getJSON(b.Addr, "/admin/v1/flow", &fl) == nil {
